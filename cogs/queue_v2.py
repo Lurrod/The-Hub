@@ -221,7 +221,7 @@ class QueueView(discord.ui.View):
 
         # Boutons a custom_id dynamique (per-instance).
         join: discord.ui.Button = discord.ui.Button(
-            label="Rejoindre",
+            label="Join",
             style=discord.ButtonStyle.success,
             custom_id=f"queue_v2:join:{queue_type}",
         )
@@ -230,7 +230,7 @@ class QueueView(discord.ui.View):
         self.add_item(join)
 
         leave: discord.ui.Button = discord.ui.Button(
-            label="Quitter",
+            label="Leave",
             style=discord.ButtonStyle.danger,
             custom_id=f"queue_v2:leave:{queue_type}",
         )
