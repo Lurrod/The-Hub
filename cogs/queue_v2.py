@@ -149,13 +149,13 @@ def build_queue_embed(
 
     if status == "forming":
         color = 0xE67E22
-        state = "🔥 Match en formation"
+        state = "🔥 Match Forming..."
     elif full:
         color = 0x2ECC71
-        state = "🟢 Queue pleine !"
+        state = "🟢 Queue Full !"
     else:
         color = 0x5865F2
-        state = "🔵 En attente de joueurs"
+        state = "🔵 Waiting for players"
 
     embed = discord.Embed(
         title=f"🎮 {label} 10mans - {count}/{QUEUE_SIZE}",
@@ -166,9 +166,9 @@ def build_queue_embed(
 
     if players:
         mentions = "\n".join(f"• <@{uid}>" for uid in players)
-        embed.add_field(name="Joueurs", value=mentions, inline=False)
+        embed.add_field(name="Players", value=mentions, inline=False)
     else:
-        embed.add_field(name="Joueurs", value="*Personne pour le moment.*", inline=False)
+        embed.add_field(name="Players", value="*No one yet.*", inline=False)
 
     embed.set_footer(text=guild.name)
     return embed
