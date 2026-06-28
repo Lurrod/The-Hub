@@ -1,11 +1,11 @@
 """
-Configuration pytest globale.
+Global pytest configuration.
 
-IMPORTANT : ce fichier est charge AVANT les tests, donc avant l'import de bot.py.
-On en profite pour :
-  1. Patcher pymongo.MongoClient avec mongomock (in-memory, pas besoin de Mongo)
-  2. Definir des variables d'environnement bidons pour que bot.py s'importe
-  3. Exposer des fixtures dpytest pour les tests d'integration Discord
+IMPORTANT: this file is loaded BEFORE the tests, hence before importing bot.py.
+We use it to:
+  1. Patch pymongo.MongoClient with mongomock (in-memory, no need for Mongo)
+  2. Define dummy environment variables so that bot.py can be imported
+  3. Expose dpytest fixtures for Discord integration tests
 """
 
 import os
@@ -16,27 +16,27 @@ import pymongo
 import pytest
 import pytest_asyncio
 
-
-# ── 1. Variables d'environnement bidons (avant import de bot.py) ──
+# -- 1. Dummy environment variables (before importing bot.py) --
 os.environ.setdefault("DISCORD_TOKEN", "test-token-not-real")
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
 
 
-# ── 2. Patch MongoClient AVANT que bot.py soit importe ────────────
-# bot.py fait `client = MongoClient(MONGO_URL)` au top-level, donc on
-# doit remplacer MongoClient au niveau du module pymongo lui-meme.
+# -- 2. Patch MongoClient BEFORE bot.py is imported --
+# bot.py runs `client = MongoClient(MONGO_URL)` at the top level, so we
+# must replace MongoClient on the pymongo module itself.
 _mongo_patcher = patch.object(pymongo, "MongoClient", mongomock.MongoClient)
 _mongo_patcher.start()
 
 
-# ── 2b. Shim dpytest pour discord.py 2.5+ ─────────────────────────
-# discord.py 2.5 passe `colors` (pluriel) a HTTPClient.create_role en
-# plus de `color`. dpytest 0.7.0 appelle make_role(**fields), qui ne
-# connait pas `colors` -> TypeError. On wrap make_role pour ignorer
-# les kwargs inconnus (on garde le mecanisme _get_higher_locs intact
-# en ne modifiant PAS create_role lui-meme).
+# -- 2b. dpytest shim for discord.py 2.5+ --
+# discord.py 2.5 passes `colors` (plural) to HTTPClient.create_role in
+# addition to `color`. dpytest 0.7.0 calls make_role(**fields), which does
+# not know `colors` -> TypeError. We wrap make_role to ignore unknown
+# kwargs (we keep the _get_higher_locs mechanism intact by NOT modifying
+# create_role itself).
 def _install_dpytest_make_role_shim() -> None:
     import inspect
+
     from discord.ext.test import backend as _dpytest_backend
 
     original_make_role = _dpytest_backend.make_role
@@ -52,10 +52,10 @@ def _install_dpytest_make_role_shim() -> None:
 _install_dpytest_make_role_shim()
 
 
-# ── 3. Reset de la base in-memory entre chaque test ───────────────
+# -- 3. Reset the in-memory database between every test --
 @pytest.fixture(autouse=True)
 def clean_mongo():
-    """Vide toutes les collections mongomock avant chaque test."""
+    """Drop all mongomock collections before every test."""
     import bot
 
     for name in bot.db.list_collection_names():
@@ -63,28 +63,29 @@ def clean_mongo():
     yield
 
 
-# ── 4. Fixture dpytest : bot Discord simule ───────────────────────
+# -- 4. dpytest fixture: simulated Discord bot --
 @pytest_asyncio.fixture
 async def discord_bot():
     """
-    Bot Discord simule via dpytest.
+    Simulated Discord bot via dpytest.
 
-    Configure automatiquement :
+    Automatically configures:
       - 1 guild "TestGuild"
-      - 1 channel texte "general"
-      - 3 membres (TestUser0, TestUser1, TestUser2)
+      - 1 text channel "general"
+      - 3 members (TestUser0, TestUser1, TestUser2)
     """
     import discord.ext.test as dpytest
+
     import bot as bot_module
 
-    # discord.py 2.x : le loop n'est pas defini avant setup_hook.
-    # On le force ici pour que dpytest puisse dispatcher des events.
+    # discord.py 2.x: the loop is not defined before setup_hook.
+    # We force it here so dpytest can dispatch events.
     await bot_module.bot._async_setup_hook()
-    # _async_setup_hook ne declenche pas setup_hook lui-meme (login
-    # uniquement). En tests, on appelle setup_hook explicitement pour
-    # charger tous les cogs (sinon /commande et !commande sont
-    # introuvables pour dpytest car les @app_commands.command et
-    # @commands.command vivent maintenant dans des cogs).
+    # _async_setup_hook does not trigger setup_hook itself (login
+    # only). In tests, we call setup_hook explicitly to load all the
+    # cogs (otherwise /command and !command are not discoverable by
+    # dpytest because @app_commands.command and @commands.command now
+    # live in cogs).
     if not bot_module.bot.cogs:
         await bot_module.setup_hook()
 
@@ -99,10 +100,10 @@ async def discord_bot():
     await dpytest.empty_queue()
 
 
-# ── 5. Helpers reutilisables ──────────────────────────────────────
+# -- 5. Reusable helpers --
 @pytest.fixture
 def fake_member(discord_bot):
-    """Retourne le 1er membre du guild de test."""
+    """Return the 1st member of the test guild."""
     import discord.ext.test as dpytest
 
     config = dpytest.get_config()

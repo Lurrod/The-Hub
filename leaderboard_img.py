@@ -1,11 +1,11 @@
 """
-Generation d'image du leaderboard via Pillow.
+Leaderboard image generation via Pillow.
 
-Style inspire du leaderboard "VRC/GC French Matchmaking" :
-fond sombre, top 3 avec badges or/argent/bronze, valeurs en vert,
-W-L colorise, footer "Play'IT Matchmaking Bot".
+Style inspired by the "VRC/GC French Matchmaking" leaderboard:
+dark background, top 3 with gold/silver/bronze badges, values in green,
+colorized W-L, footer "Play'IT Matchmaking Bot".
 
-Format d'entree (par joueur) :
+Input format (per player):
     {
         "rank":       int,
         "name":       str,
@@ -26,7 +26,6 @@ from typing import Any
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-
 # ── Layout ────────────────────────────────────────────────────────
 WIDTH = 1700
 TITLE_BAND = 100
@@ -34,7 +33,7 @@ COL_HEADER_BAND = 50
 ROW_HEIGHT = 75
 FOOTER_BAND = 55
 
-# Centres / x des colonnes
+# Column centers / x positions
 X_POS = 95
 X_AVATAR_LEFT = 165
 X_NAME_LEFT = 235
@@ -46,7 +45,7 @@ X_MATCHES = 1640
 AVATAR = 50
 BADGE = 38
 
-# ── Couleurs ──────────────────────────────────────────────────────
+# ── Colors ────────────────────────────────────────────────────────
 BG = (12, 16, 22)
 ROW_BG_A = (19, 24, 30)
 ROW_BG_B = (24, 30, 38)
@@ -63,11 +62,11 @@ SILVER = (200, 205, 215)
 BRONZE = (210, 130, 65)
 
 
-# ── Cache avatars ─────────────────────────────────────────────────
+# ── Avatar cache ──────────────────────────────────────────────────
 
-# LRU bornee : evite que le cache d'avatars croisse indefiniment
-# (1 entree par url unique, jamais TTL'e). Eviction LRU des qu'on
-# depasse `_AVATAR_CACHE_MAXSIZE`.
+# Bounded LRU: prevents the avatar cache from growing indefinitely
+# (1 entry per unique url, never TTL'd). LRU eviction as soon as
+# we exceed `_AVATAR_CACHE_MAXSIZE`.
 _AVATAR_CACHE_MAXSIZE: int = 500
 _AVATAR_CACHE: OrderedDict[str, Image.Image] = OrderedDict()
 
@@ -87,7 +86,7 @@ def _avatar_cache_set(url: str, img: Image.Image) -> None:
 
 
 def _font(size: int, bold: bool = True):
-    """Charge une police TTF du systeme. Bold par defaut."""
+    """Load a system TTF font. Bold by default."""
     bold_paths = [
         "C:\\Windows\\Fonts\\segoeuib.ttf",
         "C:\\Windows\\Fonts\\arialbd.ttf",
@@ -125,7 +124,7 @@ def _text_h(draw: ImageDraw.ImageDraw, text: str, font) -> int:
 
 
 def _draw_v_center(draw, text, x_left, y_center, font, color):
-    """Dessine `text` avec son MILIEU VERTICAL aligne sur y_center."""
+    """Draw `text` with its VERTICAL MIDDLE aligned to y_center."""
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         y_arg = y_center - (bbox[1] + bbox[3]) // 2
@@ -136,7 +135,7 @@ def _draw_v_center(draw, text, x_left, y_center, font, color):
 
 
 def _draw_xy_center(draw, text, x_center, y_center, font, color):
-    """Dessine `text` centre horizontalement ET verticalement sur (x_center, y_center)."""
+    """Draw `text` centered horizontally AND vertically on (x_center, y_center)."""
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         w = bbox[2] - bbox[0]
@@ -183,7 +182,7 @@ def generate_leaderboard(
     players: Iterable[Mapping[str, Any]],
     server_name: str = "",
 ) -> BytesIO:
-    """Genere une image PNG du leaderboard, style "VRC/GC"."""
+    """Generate a PNG leaderboard image, "VRC/GC" style."""
     plist: Sequence[Mapping[str, Any]] = list(players)
     n = len(plist)
     rows = max(1, n)
@@ -208,19 +207,19 @@ def generate_leaderboard(
     title_text += "  -  ELO"
     draw.text((50, 30), title_text, fill=WHITE, font=title_font)
 
-    # ── Column headers (centres verticalement dans la bande) ─────
+    # ── Column headers (centered vertically within the band) ────
     y_hdr_c = TITLE_BAND + COL_HEADER_BAND // 2
     _draw_xy_center(draw, "POS", X_POS, y_hdr_c, hdr_font, DIM_GRAY)
-    _draw_v_center(draw, "PLAYER", X_NAME_LEFT + 130, y_hdr_c, hdr_font, DIM_GRAY)
+    _draw_v_center(draw, "JOUEUR", X_NAME_LEFT + 130, y_hdr_c, hdr_font, DIM_GRAY)
     _draw_xy_center(draw, "ELO", X_ELO, y_hdr_c, hdr_font, DIM_GRAY)
     _draw_xy_center(draw, "W - L", X_WL, y_hdr_c, hdr_font, DIM_GRAY)
     _draw_xy_center(draw, "WIN%", X_WINPCT, y_hdr_c, hdr_font, DIM_GRAY)
-    _draw_xy_center(draw, "MATCHES", X_MATCHES, y_hdr_c, hdr_font, DIM_GRAY)
+    _draw_xy_center(draw, "MATCHS", X_MATCHES, y_hdr_c, hdr_font, DIM_GRAY)
 
     # ── Rows ────────────────────────────────────────────────────
     if n == 0:
         y = TITLE_BAND + COL_HEADER_BAND
-        draw.text((50, y + 25), "Aucun joueur enregistre.", fill=SOFT_GRAY, font=name_font)
+        draw.text((50, y + 25), "Aucun joueur enregistré.", fill=SOFT_GRAY, font=name_font)
 
     for i, p in enumerate(plist):
         y = TITLE_BAND + COL_HEADER_BAND + i * ROW_HEIGHT
@@ -265,10 +264,10 @@ def generate_leaderboard(
         shown = name if len(name) <= max_chars else name[: max_chars - 1] + "…"
         _draw_v_center(draw, shown, X_NAME_LEFT, y_c, name_font, name_color)
 
-        # ELO (vert, centre)
+        # ELO (green, centered)
         _draw_xy_center(draw, str(elo), X_ELO, y_c, val_font, GREEN)
 
-        # W - L : wins vert / dash gris / losses rouge
+        # W - L: wins green / dash gray / losses red
         wins_str = str(wins)
         losses_str = str(losses)
         dash = " - "
@@ -281,10 +280,10 @@ def generate_leaderboard(
         _draw_v_center(draw, dash, x_start + ww, y_c, val_font, SOFT_GRAY)
         _draw_v_center(draw, losses_str, x_start + ww + dw, y_c, val_font, RED)
 
-        # Win% (toujours vert)
+        # Win% (always green)
         _draw_xy_center(draw, f"{winpct}%", X_WINPCT, y_c, val_font, GREEN)
 
-        # Matches (gris doux)
+        # Matches (soft gray)
         _draw_xy_center(draw, str(matches), X_MATCHES, y_c, matches_font, SOFT_GRAY)
 
     # ── Footer ──────────────────────────────────────────────────

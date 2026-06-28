@@ -1,6 +1,6 @@
-"""Tests : classement des joueurs par inactivite (commande /inactivity).
+"""Tests: player inactivity ranking (the /inactivity command).
 
-Logique pure, sans dependance Discord ni MongoDB.
+Pure logic, no Discord or MongoDB dependency.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -9,7 +9,9 @@ import mongomock
 
 from services.inactivity import (
     DEFAULT_INACTIVITY_LIMIT,
+    LEADERBOARD_ACTIVE_DAYS,
     format_inactivity,
+    is_active,
     rank_by_inactivity,
 )
 from services.repository import get_elo_col, player_doc_id
@@ -18,7 +20,7 @@ NOW = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
 
 def _doc(name: str, last_played: datetime | None) -> dict:
-    return {"_id": f"{name}:pro", "name": name, "last_played": last_played}
+    return {"_id": f"{name}:open", "name": name, "last_played": last_played}
 
 
 # ── rank_by_inactivity ───────────────────────────────────────
@@ -72,7 +74,7 @@ def test_empty_input():
 
 
 def test_naive_last_played_treated_as_utc():
-    # Naive datetime 1 day old vs aware 1h old -> naive plus inactif -> en tete.
+    # Naive datetime 1 day old vs aware 1h old -> naive is more inactive -> first.
     naive = _doc("Naive", datetime(2026, 5, 24, 12, 0, 0))
     aware = _doc("Aware", NOW - timedelta(hours=1))
     ranked = rank_by_inactivity([aware, naive])
@@ -82,8 +84,43 @@ def test_naive_last_played_treated_as_utc():
 # ── format_inactivity ────────────────────────────────────────
 
 
+# ── is_active (leaderboard inactivity filter) ────────────────
+def test_leaderboard_active_days_is_7():
+    assert LEADERBOARD_ACTIVE_DAYS == 7
+
+
+def test_is_active_recent_player():
+    last = NOW - timedelta(days=2)
+    assert is_active(last, NOW) is True
+
+
+def test_is_active_exactly_at_threshold_is_active():
+    last = NOW - timedelta(days=7)
+    assert is_active(last, NOW) is True
+
+
+def test_is_active_just_past_threshold_is_inactive():
+    last = NOW - timedelta(days=7, minutes=1)
+    assert is_active(last, NOW) is False
+
+
+def test_is_active_never_played_is_inactive():
+    assert is_active(None, NOW) is False
+
+
+def test_is_active_naive_last_played_treated_as_utc():
+    naive = datetime(2026, 5, 23, 12, 0, 0)  # 2 days before NOW, no tzinfo
+    assert is_active(naive, NOW) is True
+
+
+def test_is_active_custom_window():
+    last = NOW - timedelta(days=10)
+    assert is_active(last, NOW) is False
+    assert is_active(last, NOW, max_idle_days=14) is True
+
+
 def test_format_never_played():
-    assert format_inactivity(None, NOW) == "jamais joué"
+    assert format_inactivity(None, NOW) == "never played"
 
 
 def test_format_days_hours_minutes():
@@ -101,14 +138,14 @@ def test_format_negative_clamped():
 
 
 def test_format_naive_last_played():
-    last = datetime(2026, 5, 24, 12, 0, 0)  # naive, 1 jour avant NOW
+    last = datetime(2026, 5, 24, 12, 0, 0)  # naive, 1 day before NOW
     assert format_inactivity(last, NOW) == "1d 0h 0m"
 
 
-# ── integration : docs reels via get_elo_col (mongomock) ─────
+# -- integration: real docs via get_elo_col (mongomock) --
 
 
-def _insert(col, uid, *, last_played, queue_type="pro"):
+def _insert(col, uid, *, last_played, queue_type="open"):
     doc = {
         "_id": player_doc_id(uid, queue_type),
         "user_id": str(uid),
@@ -127,13 +164,13 @@ def test_ranking_over_real_elo_docs_and_queue_isolation():
     db = mongomock.MongoClient(tz_aware=True).db
     col = get_elo_col(db)
     _insert(col, 1, last_played=NOW - timedelta(days=2))  # recent
-    _insert(col, 2, last_played=None)  # jamais joue -> en tete
-    _insert(col, 3, last_played=NOW - timedelta(days=30))  # le plus ancien (joue)
-    _insert(col, 99, last_played=None, queue_type="open")  # autre queue, exclu
+    _insert(col, 2, last_played=None)  # never played -> first
+    _insert(col, 3, last_played=NOW - timedelta(days=30))  # the oldest (played)
+    _insert(col, 99, last_played=None, queue_type="advanced")  # other queue, excluded
 
-    docs = list(col.find({"queue_type": "pro"}))
+    docs = list(col.find({"queue_type": "open"}))
     ranked = rank_by_inactivity(docs)
 
     assert [d["user_id"] for d in ranked] == ["2", "3", "1"]
-    # le mention se reconstruit aussi depuis le _id compound
+    # mention also rebuilds from the compound _id
     assert str(ranked[1]["_id"]).rsplit(":", 1)[0] == "3"

@@ -4,6 +4,6 @@
 # explicitement apres avoir valide la suite contre le nouveau major.
 discord.py>=2.5,<3
 pymongo>=4.6,<5
-pillow>=10.0,<12
+pillow>=12.1.1,<13
 requests>=2.31,<3
 python-dotenv>=1.0,<2

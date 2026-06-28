@@ -1,19 +1,19 @@
 """
-Tests du client HenrikDev avec mocks de requests.Session.
-On NE fait JAMAIS d'appel reseau reel ici.
+Tests of the HenrikDev client with requests.Session mocks.
+We NEVER make a real network call here.
 """
 
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 import pytest
 
 from services.riot_api import (
+    VALID_REGIONS,
     HenrikDevClient,
     PlayerNotFoundError,
     RateLimitedError,
     RiotApiError,
-    VALID_REGIONS,
 )
 
 
@@ -71,7 +71,7 @@ def test_network_error_wrapped_as_riot_api_error():
     session = MagicMock()
     session.get.side_effect = _requests.ConnectionError("DNS fail")
     client = HenrikDevClient(session=session)
-    with pytest.raises(RiotApiError, match="reseau"):
+    with pytest.raises(RiotApiError, match="Network"):
         client.get_account("X", "1")
 
 
@@ -115,7 +115,7 @@ def test_get_current_mmr_handles_missing_fields():
 def test_get_current_mmr_rejects_invalid_region():
     session = _make_session(_mock_response(200))
     client = HenrikDevClient(session=session)
-    with pytest.raises(ValueError, match="Region"):
+    with pytest.raises(ValueError, match="region"):
         client.get_current_mmr("middle-earth", "X", "1")
 
 
@@ -200,12 +200,12 @@ def test_cache_avoids_double_api_calls():
     client.get_account("Player", "EUW")
     client.get_account("Player", "EUW")
 
-    # 1 seul appel HTTP, les 2 suivants viennent du cache
+    # Single HTTP call, the next 2 come from the cache
     assert session.get.call_count == 1
 
 
 def test_cache_distinct_keys():
-    """Pseudo different = cle different = pas de hit."""
+    """Different nickname = different key = no hit."""
     session = MagicMock()
     session.get.side_effect = [
         _mock_response(200, {"status": 200, "data": {"puuid": "alice"}}),
@@ -232,8 +232,8 @@ def test_clear_cache_forces_refresh():
 
 
 def test_get_match_history_bypasses_cache():
-    """Le polling de match_history doit toujours faire un appel reseau frais.
-    Sans bypass, le 1er retry renverrait stale 'pas encore indexe' pendant 1h."""
+    """match_history polling must always issue a fresh network call.
+    Without bypass, the 1st retry would return stale 'not yet indexed' for 1h."""
     session = MagicMock()
     session.get.side_effect = [
         _mock_response(200, {"status": 200, "data": []}),
@@ -268,7 +268,7 @@ def test_get_match_history_bypasses_cache():
 
 
 def test_get_match_history_does_not_pollute_cache():
-    """Apres un appel match_history, aucune entree n'est ajoutee au cache."""
+    """After a match_history call, no entry is added to the cache."""
     session = _make_session(_mock_response(200, {"status": 200, "data": []}))
     client = HenrikDevClient(session=session)
     client.get_match_history("eu", "Player", "EUW", mode="custom")
@@ -293,3 +293,36 @@ def test_no_authorization_header_without_key(monkeypatch):
 
     _, kwargs = session.get.call_args
     assert "Authorization" not in kwargs["headers"]
+
+
+# ── MatchPlayerStats extended fields ───────────────────────────────
+def test_match_player_stats_dataclass_has_extended_fields():
+    from services.riot_api import MatchPlayerStats
+
+    s = MatchPlayerStats(
+        puuid="p",
+        name="n",
+        tag="t",
+        team="Red",
+        score=0,
+        kills=0,
+        deaths=0,
+        assists=0,
+        agent="",
+        damage_made=0,
+        damage_received=0,
+        headshots=0,
+        bodyshots=0,
+        legshots=0,
+        multikills_2k=0,
+        multikills_3k=0,
+        multikills_4k=0,
+        multikills_5k=0,
+        first_kills=0,
+        first_deaths=0,
+        kast_rounds=0,
+    )
+    assert s.damage_made == 0
+    assert s.kast_rounds == 0
+    assert s.multikills_5k == 0
+    assert s.first_deaths == 0

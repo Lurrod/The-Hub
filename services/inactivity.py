@@ -1,40 +1,61 @@
-"""Classement des joueurs par inactivite (temps ecoule depuis la derniere partie).
+"""Ranking of players by inactivity (time elapsed since their last game).
 
-Logique pure, sans dependance Discord ni MongoDB, pour etre testable
-isolement. Le cog `elo_admin` l'utilise pour la commande /inactivity.
+Pure logic, without Discord or MongoDB dependency, so it can be tested
+in isolation. The `elo_admin` cog uses it for the /inactivity command.
 
-Le champ `last_played` est horodate sur chaque match valide par
-`services.elo_updater`. Un joueur sans `last_played` n'a jamais joue de
-match valide depuis l'introduction du suivi : il est considere comme le
-plus inactif.
+The `last_played` field is timestamped on every valid match by
+`services.elo_updater`. A player without `last_played` has never played
+a valid match since the introduction of this tracking: they are
+considered the most inactive.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 DEFAULT_INACTIVITY_LIMIT = 25
 
+# A player who has not played within this many days is hidden from the
+# leaderboard.
+LEADERBOARD_ACTIVE_DAYS = 7
+
 
 def _as_utc(value: datetime) -> datetime:
-    """Normalise un datetime naive en UTC (coherent avec l'eligibilite)."""
+    """Normalize a naive datetime to UTC (consistent with eligibility)."""
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
 
 
+def is_active(
+    last_played: datetime | None,
+    now: datetime,
+    *,
+    max_idle_days: int = LEADERBOARD_ACTIVE_DAYS,
+) -> bool:
+    """True if the player played within `max_idle_days`.
+
+    A player without `last_played` (never played) is considered inactive.
+    The threshold is inclusive: exactly `max_idle_days` ago still counts
+    as active.
+    """
+    if last_played is None:
+        return False
+    return _as_utc(now) - _as_utc(last_played) <= timedelta(days=max_idle_days)
+
+
 def rank_by_inactivity(
     docs: Sequence[Mapping[str, Any]], *, limit: int = DEFAULT_INACTIVITY_LIMIT
 ) -> list[Mapping[str, Any]]:
-    """Trie les docs joueurs du plus inactif au moins inactif.
+    """Sort player docs from most inactive to least inactive.
 
-    - Les joueurs sans `last_played` sont les plus inactifs -> places en tete.
-    - Les autres sont tries par `last_played` croissant (le plus ancien d'abord).
-    - `name` sert de depart pour un ordre deterministe.
+    - Players without `last_played` are the most inactive -> placed first.
+    - Others are sorted by `last_played` ascending (oldest first).
+    - `name` serves as a tiebreaker for a deterministic order.
 
-    Renvoie au plus `limit` docs (liste vide si `limit <= 0`).
+    Returns at most `limit` docs (empty list if `limit <= 0`).
     """
 
     def sort_key(doc: Mapping[str, Any]) -> tuple[int, float, str]:
@@ -48,12 +69,12 @@ def rank_by_inactivity(
 
 
 def format_inactivity(last_played: datetime | None, now: datetime) -> str:
-    """Texte d'inactivite : « jamais joué » ou « Xd Xh Xm ».
+    """Inactivity text: "never played" or "Xd Xh Xm".
 
-    La duree negative (horloge en avance) est ramenee a zero.
+    A negative duration (clock skew) is clamped to zero.
     """
     if last_played is None:
-        return "jamais joué"
+        return "never played"
     delta = _as_utc(now) - _as_utc(last_played)
     total_minutes = max(int(delta.total_seconds() // 60), 0)
     days, rem = divmod(total_minutes, 1440)

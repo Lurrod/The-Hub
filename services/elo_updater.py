@@ -1,9 +1,10 @@
 """
-Met a jour l'ELO des joueurs (collection partagée `elo`) apres validation
-d'un match V2.
+Updates player ELO (shared collection `elo`) after the validation of a V2
+match.
 
-Le gain/loss est proportionnel a la moyenne d'effective_elo (Riot) des
-10 joueurs du match : avg=1500 -> +20/-10, avg=3000 -> +40/-20.
+Flat +20 / -20 per match across all queues. The previous ACS-based
+per-player scaling has been removed: every winner gets +20, every loser
+loses 20 (clamped at 0).
 """
 
 from __future__ import annotations
@@ -16,17 +17,13 @@ from pymongo import ReturnDocument
 
 from services import elo_calc, repository
 
-
 VALIDATED_A: Final[str] = "validated_a"
 VALIDATED_B: Final[str] = "validated_b"
 
-# Fallback fixe quand HenrikDev ne fournit pas de multiplicateurs ACS
-# (custom introuvable apres timeout 30 min, ou extraction impossible :
-# teams mixtes Attack/Defense en lobby Valorant). On applique +20/-20
-# a plat plutot que la valeur proportionnelle a l'avg ELO du match.
-# C'est plus lisible pour les joueurs et evite les variations bizarres
-# (15/17/19) selon le tier moyen.
-FLAT_FALLBACK_ELO_CHANGE: Final[int] = 16
+# Flat ELO change applied to every validated match, all queues.
+FLAT_ELO_CHANGE: Final[int] = 20
+# Backward-compatible alias for legacy imports/tests.
+FLAT_FALLBACK_ELO_CHANGE: Final[int] = FLAT_ELO_CHANGE
 
 
 @dataclass(frozen=True)
@@ -46,31 +43,56 @@ class MatchEloOutcome:
     gain: int
     loss: int
     changes: tuple[PlayerEloChange, ...]
-    weighted: bool = False  # True si appel avec multipliers Henrik
+    weighted: bool = False  # True if called with Henrik multipliers
+
+
+def _player_delta(
+    player: dict,
+    *,
+    win: bool,
+    ratings: dict[str, float] | None,
+) -> int:
+    """Weighted delta for a Pro/Semi-Pro player, or flat ±20 fallback.
+
+    Falls back to the flat change when the player's Rating 2.0 is absent
+    or invalid (<= 0), e.g. forfeits or missing Henrik data.
+    """
+    rating = (ratings or {}).get(str(player["id"]))
+    if rating is None or rating <= 0:
+        return FLAT_ELO_CHANGE if win else -FLAT_ELO_CHANGE
+    return elo_calc.compute_weighted_delta(rating, win=win)
 
 
 def apply_match_validation(
     db,
     match_doc: dict,
     multipliers: dict[str, float] | None = None,
+    ratings: dict[str, float] | None = None,
 ) -> MatchEloOutcome:
     """
-    Distribue les ELO en une seule passe, **zero-sum strict**.
+    Distribute ELO in a single pass.
 
-    Plancher a 0 : si un perdant a moins d'ELO que la perte calculee, son
-    delta est clamp a -old_elo (ne descend pas sous 0).
+    Default: flat ±20 for every player (Open / GC queues). For the **Pro
+    and Semi-Pro queues**, when per-player Rating 2.0 scores are provided
+    via `ratings`, each delta is weighted by performance (see
+    `elo_calc.compute_weighted_delta`). Players whose rating is missing or
+    invalid (<= 0) fall back to the flat ±20.
+
+    Floor at 0: if a loser has less ELO than the loss, their delta is
+    clamped to -old_elo (does not go below 0).
 
     Args:
-        db:          Database mongomock/pymongo (collection ELO partagee)
-        match_doc:   doc match avec `team_a`, `team_b`, `status`, `queue_type`
-        multipliers: dict user_id (str) -> multiplicateur ACS (~0.7..1.3)
+        db:          mongomock/pymongo Database (shared ELO collection)
+        match_doc:   match doc with `team_a`, `team_b`, `status`, `queue_type`
+        multipliers: kept for backward compatibility; ignored.
+        ratings:     {user_id(str) -> Rating 2.0}. Used in pro/semipro queues.
 
     Raises:
-        ValueError si status != validated_a/b
+        ValueError if status != validated_a/b
     """
     status = match_doc.get("status")
     if status not in (VALIDATED_A, VALIDATED_B):
-        raise ValueError(f"Match non valide : status={status}")
+        raise ValueError(f"Match not valid: status={status}")
 
     queue_type = match_doc.get("queue_type", "open")
 
@@ -81,24 +103,28 @@ def apply_match_validation(
 
     avg_elo = elo_calc.compute_team_avg_elo(winners + losers)
 
-    if multipliers is None:
-        base_gain = base_loss = FLAT_FALLBACK_ELO_CHANGE
-        mults: dict[str, float] = {}
-        weighted = False
-    else:
-        base_gain, base_loss = elo_calc.compute_match_elo_change(avg_elo)
-        mults = multipliers
-        weighted = True
+    base_gain = base_loss = FLAT_ELO_CHANGE
+
+    # Performance weighting applies to the Pro and Semi-Pro queues and
+    # requires per-player Rating 2.0 scores. Anything else stays on the
+    # flat ±20 path.
+    # Rating 2.0 weighting applies to BOTH queues (Open + Advanced) when
+    # Henrik returned per-player ratings; otherwise flat ELO is used.
+    weighted = bool(ratings)
 
     elo_col = repository.get_elo_col(db)
 
-    winner_mults = [float(mults.get(str(p["id"]), 1.0)) for p in winners]
-    loser_mults = [float(mults.get(str(p["id"]), 1.0)) for p in losers]
+    winner_mults = [1.0 for _ in winners]
+    loser_mults = [1.0 for _ in losers]
 
-    winner_deltas = [round(+base_gain * m) for m in winner_mults]
-    loser_deltas = [round(-base_loss * (2.0 - m)) for m in loser_mults]
+    if weighted:
+        winner_deltas = [_player_delta(p, win=True, ratings=ratings) for p in winners]
+        loser_deltas = [_player_delta(p, win=False, ratings=ratings) for p in losers]
+    else:
+        winner_deltas = [+base_gain for _ in winners]
+        loser_deltas = [-base_loss for _ in losers]
 
-    # Clamp a 0 ELO pour les perdants (compound _id pour le lookup).
+    # Clamp to 0 ELO for losers (compound _id for the lookup).
     loser_old_elos: list[int] = []
     for p in losers:
         doc = elo_col.find_one({"_id": repository.player_doc_id(p["id"], queue_type)})
@@ -155,10 +181,10 @@ def _apply_player(
     win: bool,
     multiplier: float = 1.0,
 ) -> PlayerEloChange:
-    """Applique le delta ELO de maniere idempotente par match.
+    """Apply the ELO delta idempotently per match.
 
-    Le doc joueur est identifie par compound _id `<user_id>:<queue_type>`.
-    L'idempotence par match est preservee via `processed_matches`."""
+    The player doc is identified by the compound _id `<user_id>:<queue_type>`.
+    Per-match idempotence is preserved via `processed_matches`."""
     uid = str(player["id"])
     name = player.get("name", uid)
     doc_id = repository.player_doc_id(uid, queue_type)
@@ -182,8 +208,8 @@ def _apply_player(
     inc_field = "wins" if win else "losses"
     update: dict[str, Any] = {
         "$inc": {"elo": delta, inc_field: 1},
-        # last_played : horodate la derniere partie jouee. Lu par le
-        # leaderboard Pro permanent pour retirer les inactifs (> 7 jours).
+        # last_played: timestamp of the last game played. Read by the
+        # permanent Pro leaderboard to remove inactives (> 7 days).
         "$set": {"name": name, "last_played": datetime.now(UTC)},
     }
     if match_id_str is not None:
@@ -222,3 +248,21 @@ def _apply_player(
         win=win,
         multiplier=multiplier,
     )
+
+
+def build_elo_results(outcome: MatchEloOutcome) -> dict[str, dict[str, Any]]:
+    """Serialize a `MatchEloOutcome` into a per-player map for persistence.
+
+    Shape: ``{ "<user_id>": {"delta": int, "old": int, "new": int,
+    "win": bool} }``. Stored on the match doc so consumers (e.g. the stats
+    website) can show each player's ELO change for that match.
+    """
+    return {
+        str(c.user_id): {
+            "delta": int(c.delta),
+            "old": int(c.old_elo),
+            "new": int(c.new_elo),
+            "win": bool(c.win),
+        }
+        for c in outcome.changes
+    }

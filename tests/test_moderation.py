@@ -1,4 +1,4 @@
-"""Tests du cog moderation (/warn et /warn-list)."""
+"""Tests for the moderation cog (/warn and /warn-list)."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,7 +14,6 @@ from cogs.moderation import (
     _truncate,
 )
 from services import repository
-
 
 # ── Helpers ────────────────────────────────────────────────────────
 
@@ -68,14 +67,14 @@ def test_has_warn_access_manage_guild_perm():
 
 
 def test_has_warn_access_warn_role():
-    user = _member(roles=[_role("Head Administrators")])
+    user = _member(roles=[_role("THE HUB")])
     assert _has_warn_access(user) is True
 
 
 def test_has_warn_access_any_warn_role():
     for role_name in WARN_ROLE_NAMES:
         user = _member(roles=[_role(role_name)])
-        assert _has_warn_access(user) is True, f"role {role_name!r} doit etre accepte"
+        assert _has_warn_access(user) is True, f"role {role_name!r} must be accepted"
 
 
 def test_has_warn_access_refused_without_perm_or_role():
@@ -101,9 +100,9 @@ def test_truncate_cuts_with_ellipsis():
 
 @pytest.mark.asyncio
 async def test_warn_refused_outside_guild():
-    """interaction.user n'est pas un Member -> refus."""
+    """interaction.user is not a Member -> refused."""
     cog = ModerationCog(bot_module.bot, bot_module.db)
-    user = MagicMock()  # pas un Member
+    user = MagicMock()  # not a Member
     inter = _interaction(user)
     target = _member(member_id=2, name="Target")
 
@@ -124,7 +123,7 @@ async def test_warn_refused_without_permission():
     await cog.warn.callback(cog, inter, target, "spam")
 
     msg = inter.response.send_message.await_args.args[0]
-    assert "pas la permission" in msg
+    assert "n'as pas la permission" in msg
 
 
 @pytest.mark.asyncio
@@ -137,7 +136,7 @@ async def test_warn_refused_on_bot_target():
     await cog.warn.callback(cog, inter, target, "spam")
 
     msg = inter.response.send_message.await_args.args[0]
-    assert "warn un bot" in msg
+    assert "avertir un bot" in msg
 
 
 @pytest.mark.asyncio
@@ -149,7 +148,7 @@ async def test_warn_refused_on_self():
     await cog.warn.callback(cog, inter, user, "spam")
 
     msg = inter.response.send_message.await_args.args[0]
-    assert "te warn toi-meme" in msg
+    assert "t'avertir toi-même" in msg
 
 
 @pytest.mark.asyncio
@@ -159,50 +158,50 @@ async def test_warn_happy_path_persists_and_dms():
     inter = _interaction(user, guild_id=99)
     target = _member(member_id=2, name="Target")
 
-    await cog.warn.callback(cog, inter, target, "spam excessif")
+    await cog.warn.callback(cog, inter, target, "excessive spam")
 
-    # DM envoye
+    # DM sent
     target.send.assert_awaited_once()
-    # Persistance
+    # Persistence
     warns = repository.list_warns(bot_module.db, 99)
     assert len(warns) == 1
     assert warns[0]["member_id"] == 2
-    assert warns[0]["reason"] == "spam excessif"
-    # Reponse "succes"
+    assert warns[0]["reason"] == "excessive spam"
+    # "success" response
     msg = inter.response.send_message.await_args.args[0]
     assert "✅" in msg
 
 
 @pytest.mark.asyncio
 async def test_warn_forbidden_dm_still_persists():
-    """DM fermes -> warn quand meme persiste + message d'avertissement."""
+    """DMs closed -> warn still persists + advisory message."""
     cog = ModerationCog(bot_module.bot, bot_module.db)
     user = _member(member_id=1, name="Mod", manage_guild=True)
     inter = _interaction(user, guild_id=99)
     target = _member(member_id=2, name="Target")
     target.send.side_effect = discord.Forbidden(MagicMock(status=403), "DMs closed")
 
-    await cog.warn.callback(cog, inter, target, "raison")
+    await cog.warn.callback(cog, inter, target, "reason")
 
     warns = repository.list_warns(bot_module.db, 99)
     assert len(warns) == 1
     msg = inter.response.send_message.await_args.args[0]
-    assert "DM impossible" in msg or "DM fermes" in msg
+    assert "MP impossible" in msg
 
 
 @pytest.mark.asyncio
 async def test_warn_http_exception_dm_still_persists():
-    """HTTPException transitoire sur DM -> persistance preservee (regression test)."""
+    """Transient HTTPException on DM -> persistence preserved (regression test)."""
     cog = ModerationCog(bot_module.bot, bot_module.db)
     user = _member(member_id=1, name="Mod", manage_guild=True)
     inter = _interaction(user, guild_id=99)
     target = _member(member_id=2, name="Target")
     target.send.side_effect = discord.HTTPException(MagicMock(status=500), "transient")
 
-    await cog.warn.callback(cog, inter, target, "raison")
+    await cog.warn.callback(cog, inter, target, "reason")
 
     warns = repository.list_warns(bot_module.db, 99)
-    assert len(warns) == 1, "Un blip reseau sur le DM ne doit PAS faire perdre le warn"
+    assert len(warns) == 1, "A network blip on the DM must NOT drop the warn"
 
 
 # ── /warn-list ─────────────────────────────────────────────────────
@@ -211,7 +210,7 @@ async def test_warn_http_exception_dm_still_persists():
 @pytest.mark.asyncio
 async def test_warn_list_refused_outside_guild():
     cog = ModerationCog(bot_module.bot, bot_module.db)
-    inter = _interaction(MagicMock())  # user non-Member
+    inter = _interaction(MagicMock())  # non-Member user
     await cog.warn_list.callback(cog, inter, None)
     msg = inter.response.send_message.await_args.args[0]
     assert "uniquement dans un serveur" in msg
@@ -224,7 +223,7 @@ async def test_warn_list_refused_without_permission():
     inter = _interaction(user)
     await cog.warn_list.callback(cog, inter, None)
     msg = inter.response.send_message.await_args.args[0]
-    assert "pas la permission" in msg
+    assert "n'as pas la permission" in msg
 
 
 @pytest.mark.asyncio
@@ -242,7 +241,7 @@ async def test_warn_list_empty_no_filter():
 async def test_warn_list_filters_by_member():
     cog = ModerationCog(bot_module.bot, bot_module.db)
     user = _member(member_id=1, manage_guild=True)
-    # Pre-insere 2 warns sur 2 membres differents
+    # Pre-insert 2 warns on 2 different members
     repository.add_warn(
         bot_module.db,
         42,
@@ -266,7 +265,7 @@ async def test_warn_list_filters_by_member():
     await cog.warn_list.callback(cog, inter, target)
     kwargs = inter.response.send_message.await_args.kwargs
     embed = kwargs["embed"]
-    # Un seul field (warn de member 10 uniquement)
+    # Single field (warn from member 10 only)
     assert len(embed.fields) == 1
     assert "<@10>" in embed.fields[0].name
 
@@ -275,7 +274,7 @@ async def test_warn_list_filters_by_member():
 async def test_warn_list_page_size_caps_at_constant():
     cog = ModerationCog(bot_module.bot, bot_module.db)
     user = _member(manage_guild=True)
-    # Pre-insere plus de WARN_LIST_PAGE_SIZE warns
+    # Pre-insert more than WARN_LIST_PAGE_SIZE warns
     for i in range(WARN_LIST_PAGE_SIZE + 5):
         repository.add_warn(
             bot_module.db,

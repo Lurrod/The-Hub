@@ -1,20 +1,19 @@
 """
-Cog candidatures + welcome + report. Extrait de bot.py (refactor monolithe).
+Applications + welcome + report cog. Extracted from bot.py (monolith refactor).
 
-Contient :
-  - Systeme de candidatures (ApplicationModal, StaffModal, RefuseReasonModal,
-    RoleChoiceView, WelcomeView, ApplicationReviewView).
-  - /welcome : pose le bouton Postuler dans #verify.
-  - /report : pose le panel d'ouverture de ticket (TicketPanelView) avec 2
-    options dans le salon courant :
-      * Reports -> ReportModal (signalement anonyme).
-      * Ranks   -> RankModal (candidature de rank, candidat identifie).
-  - _open_ticket_channel : cree le salon `ticket-{N}` (mutualise Reports/Ranks).
-  - CloseTicketView : ferme un ticket.
+Contains:
+  - Application system (ApplicationModal, StaffModal, RefuseReasonModal,
+    WelcomeView, ApplicationReviewView).
+  - /welcome: posts one Apply button per queue tier (+ Coach button) in #verify.
+  - /report: posts the ticket opening panel (TicketPanelView) with 2
+    options in the current channel:
+      * Reports -> ReportModal (anonymous report).
+      * Ranks   -> RankModal (rank application, identified candidate).
+  - _open_ticket_channel: creates the `ticket-{N}` channel (shared by Reports/Ranks).
+  - CloseTicketView: closes a ticket.
 
-Toutes les views persistantes (custom_id stable) sont enregistrees via
-`bot.add_view(...)` dans `setup()`. Les Modals et la RoleChoiceView (timeout =
-APPLICATION_VIEW_TIMEOUT_SECONDS) sont instancies a la volee.
+All persistent views (stable custom_id) are registered via
+`bot.add_view(...)` in `setup()`. Modals are instantiated on the fly.
 """
 
 from __future__ import annotations
@@ -33,25 +32,31 @@ from services import repository
 
 logger = logging.getLogger(__name__)
 
-# Timeout d'une RoleChoiceView ephemere (Joueur vs Staff). Decouple
-# volontairement de VOTE_TIMEOUT_MINUTES : c'est une UX rapide, pas le flow
-# match.
-APPLICATION_VIEW_TIMEOUT_SECONDS: int = 60
 
-
-# ── Constantes ───────────────────────────────────────────────────
-CANDIDATURE_CHANNEL = "candidatures"
+# ── Constants ───────────────────────────────────────────────────
+CANDIDATURE_CHANNEL = "applications"
 WELCOME_CHANNEL = "verify"
 PLAYERS_ROLE = "Members"
 STAFF_ROLE = "Coach/Analyst/Manager"
 TICKETS_CATEGORY_NAME = "Tickets"
 CANDIDATURE_COOLDOWN_SECONDS = 3600
 
+# Player application queues: the single Advanced queue is gated by a role
+# granted on accept. The Apply button on /welcome targets the Advanced
+# queue, the modal carries it through the embed, and the gating role is
+# auto-assigned when an admin clicks Accept.
+# The Open queue is intentionally absent: it is UNGATED (no role required),
+# so the welcome Open button grants no special queue role.
+QUEUE_TIERS: dict[str, tuple[str, str]] = {
+    "advanced": ("Advanced Queue", "Rank Q | Advanced Queue"),
+}
+QUEUE_TIER_FIELD_NAME = "🎯 File ciblée"
+
 
 def _has_access(interaction: discord.Interaction, db) -> bool:
-    """Reproduit `bot.has_access` sans dependance circulaire.
+    """Reproduces `bot.has_access` without circular dependency.
 
-    Admin (manage_guild) OU role bypass configure via /bypass.
+    Admin (manage_guild) OR bypass role configured via /bypass.
     """
     if interaction.user.guild_permissions.manage_guild:
         return True
@@ -60,11 +65,11 @@ def _has_access(interaction: discord.Interaction, db) -> bool:
 
 
 def _try_acquire_candidature_cooldown(db, uid: str) -> tuple[bool, float]:
-    """Tente d'acquerir atomiquement un slot de cooldown candidature.
+    """Atomically attempts to acquire an application cooldown slot.
 
-    Resout la race read-then-write : deux soumissions concurrentes ne
-    peuvent pas toutes deux passer le check (CAS via update conditionnel
-    + insert avec gestion DuplicateKeyError).
+    Resolves the read-then-write race: two concurrent submissions cannot
+    both pass the check (CAS via conditional update + insert with
+    DuplicateKeyError handling).
     """
     now = datetime.now(UTC)
     cutoff = now - timedelta(seconds=CANDIDATURE_COOLDOWN_SECONDS)
@@ -92,14 +97,23 @@ def _try_acquire_candidature_cooldown(db, uid: str) -> tuple[bool, float]:
     return False, remaining
 
 
-def _parse_application_embed(message: discord.Message) -> tuple[int | None, str, bool]:
-    """Extrait (applicant_id, pseudo, is_staff) depuis l'embed d'une candidature.
+def _parse_application_embed(
+    message: discord.Message,
+) -> tuple[int | None, str, bool, str | None]:
+    """Extracts (applicant_id, username, is_staff, queue_tier) from an
+    application embed.
 
-    Permet a `ApplicationReviewView` d'etre persistante (sans state interne)
-    en reconstruisant le contexte depuis le message a chaque clic.
+    Allows `ApplicationReviewView` to be persistent (without internal state)
+    by reconstructing the context from the message on each click.
+
+    `queue_tier` is the QUEUE_TIERS key matching the embed's
+    `QUEUE_TIER_FIELD_NAME` value, or None for:
+      - staff applications (no queue),
+      - legacy embeds (pre-queue-tier rollout),
+      - unknown queue labels (safer than guessing).
     """
     if not message.embeds:
-        return None, "", False
+        return None, "", False, None
     embed = message.embeds[0]
     is_staff = "Staff" in (embed.title or "")
     applicant_id: int | None = None
@@ -110,35 +124,48 @@ def _parse_application_embed(message: discord.Message) -> tuple[int | None, str,
         except (ValueError, IndexError):
             applicant_id = None
     pseudo = ""
+    queue_label: str | None = None
     for field in embed.fields:
         if field.name in ("🎮 Pseudo en jeu", "🎮 Pseudo"):
             pseudo = field.value or ""
-            break
-    return applicant_id, pseudo, is_staff
+        elif field.name == QUEUE_TIER_FIELD_NAME:
+            queue_label = (field.value or "").strip()
+    queue_tier: str | None = None
+    if queue_label:
+        for tier_key, (label, _role) in QUEUE_TIERS.items():
+            if label == queue_label:
+                queue_tier = tier_key
+                break
+    return applicant_id, pseudo, is_staff, queue_tier
 
 
 # ── Modals ────────────────────────────────────────────────────────
 class ApplicationModal(discord.ui.Modal, title="Candidature 10mans"):
     pseudo: discord.ui.TextInput = discord.ui.TextInput(
         label="Quel est ton pseudo ?",
-        placeholder="Comment puis-je t'appeler ? ex : jetax",
+        placeholder="Comment dois-je t'appeler ? ex. jetax",
         max_length=50,
     )
     tracker: discord.ui.TextInput = discord.ui.TextInput(
         label="Lien vers ton tracker", placeholder="https://tracker.gg/...", max_length=200
     )
     experience: discord.ui.TextInput = discord.ui.TextInput(
-        label="Experiences en tournois / LAN ?",
-        placeholder="Indique les tournois/lans auxquels tu as participe",
+        label="Expérience tournois / LAN ?",
+        placeholder="Liste les tournois/LAN auxquels tu as participé",
         style=discord.TextStyle.paragraph,
         required=False,
         max_length=500,
     )
 
-    def __init__(self, db, review_view: ApplicationReviewView) -> None:
+    def __init__(self, db, review_view: ApplicationReviewView, queue_tier: str) -> None:
         super().__init__()
+        if queue_tier not in QUEUE_TIERS:
+            raise ValueError(
+                f"unknown queue_tier {queue_tier!r}; expected one of {list(QUEUE_TIERS)}"
+            )
         self.db = db
         self.review_view = review_view
+        self.queue_tier = queue_tier
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -156,28 +183,30 @@ class ApplicationModal(discord.ui.Modal, title="Candidature 10mans"):
             await interaction.user.send(
                 embed=discord.Embed(
                     title="✅ Candidature reçue !",
-                    description="Merci d'avoir postulé, nous analysons votre profil et nous revenons vers vous le plus vite possible.",
+                    description="Merci pour ta candidature, nous étudions ton profil et reviendrons vers toi dès que possible.",
                     color=0x2ECC71,
                     timestamp=datetime.now(UTC),
                 )
             )
         channel = discord.utils.get(interaction.guild.text_channels, name=CANDIDATURE_CHANNEL)
         if not channel:
-            await interaction.followup.send("Salon candidatures introuvable.", ephemeral=True)
+            await interaction.followup.send("Salon des candidatures introuvable.", ephemeral=True)
             return
+        queue_label, _queue_role = QUEUE_TIERS[self.queue_tier]
         embed = discord.Embed(
             title="📋 Nouvelle candidature",
-            description="🎮 **Candidature Joueur**",
+            description="🎮 **Candidature joueur**",
             color=0x5865F2,
             timestamp=datetime.now(UTC),
         )
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="👤 Membre", value=interaction.user.mention, inline=True)
         embed.add_field(name="🎮 Pseudo en jeu", value=self.pseudo.value, inline=True)
+        embed.add_field(name=QUEUE_TIER_FIELD_NAME, value=queue_label, inline=True)
         embed.add_field(name="🔗 Tracker", value=self.tracker.value, inline=False)
         embed.add_field(
             name="🏆 Tournois / LAN",
-            value=self.experience.value if self.experience.value else "Aucune",
+            value=self.experience.value if self.experience.value else "Aucun",
             inline=False,
         )
         embed.set_footer(text=f"ID: {interaction.user.id}")
@@ -195,17 +224,17 @@ class ApplicationModal(discord.ui.Modal, title="Candidature 10mans"):
 class StaffModal(discord.ui.Modal, title="Candidature Staff"):
     pseudo: discord.ui.TextInput = discord.ui.TextInput(
         label="Quel est ton pseudo ?",
-        placeholder="Comment puis-je t'appeler ? ex : jetax",
+        placeholder="Comment dois-je t'appeler ? ex. jetax",
         max_length=50,
     )
     poste: discord.ui.TextInput = discord.ui.TextInput(
-        label="Poste occupe actuellement",
-        placeholder="Ex : Coach, Analyst, Manager... et dans quelle structure/organisation ?",
+        label="Poste actuel",
+        placeholder="ex. Coach, Analyste, Manager... et dans quelle structure/organisation ?",
         max_length=100,
     )
     experience: discord.ui.TextInput = discord.ui.TextInput(
-        label="Experiences",
-        placeholder="Decris tes experiences dans le domaine...",
+        label="Expérience",
+        placeholder="Décris ton expérience dans le domaine...",
         style=discord.TextStyle.paragraph,
         required=False,
         max_length=500,
@@ -232,18 +261,18 @@ class StaffModal(discord.ui.Modal, title="Candidature Staff"):
             await interaction.user.send(
                 embed=discord.Embed(
                     title="✅ Candidature reçue !",
-                    description="Merci d'avoir postulé, nous analysons votre profil et nous revenons vers vous le plus vite possible.",
+                    description="Merci pour ta candidature, nous étudions ton profil et reviendrons vers toi dès que possible.",
                     color=0x2ECC71,
                     timestamp=datetime.now(UTC),
                 )
             )
         channel = discord.utils.get(interaction.guild.text_channels, name=CANDIDATURE_CHANNEL)
         if not channel:
-            await interaction.followup.send("Salon candidatures introuvable.", ephemeral=True)
+            await interaction.followup.send("Salon des candidatures introuvable.", ephemeral=True)
             return
         embed = discord.Embed(
             title="📋 Nouvelle candidature Staff",
-            description="🎯 **Candidature Coach / Analyst / Manager**",
+            description="🎯 **Candidature Coach / Analyste / Manager**",
             color=0xE67E22,
             timestamp=datetime.now(UTC),
         )
@@ -252,7 +281,7 @@ class StaffModal(discord.ui.Modal, title="Candidature Staff"):
         embed.add_field(name="🎮 Pseudo", value=self.pseudo.value, inline=True)
         embed.add_field(name="💼 Poste", value=self.poste.value, inline=False)
         embed.add_field(
-            name="📋 Expériences",
+            name="📋 Expérience",
             value=self.experience.value if self.experience.value else "Aucune",
             inline=False,
         )
@@ -270,7 +299,7 @@ class StaffModal(discord.ui.Modal, title="Candidature Staff"):
 
 class RefuseReasonModal(discord.ui.Modal, title="Raison du refus"):
     reason: discord.ui.TextInput = discord.ui.TextInput(
-        label="Raison du refus (optionnel)",
+        label="Raison du refus (facultatif)",
         placeholder="Explique pourquoi...",
         style=discord.TextStyle.paragraph,
         required=False,
@@ -293,7 +322,7 @@ class RefuseReasonModal(discord.ui.Modal, title="Raison du refus"):
         )
         if not claimed:
             await interaction.followup.send(
-                "❌ Cette candidature a deja ete traitee par un autre admin.",
+                "❌ Cette candidature a déjà été traitée par un autre admin.",
                 ephemeral=True,
             )
             return
@@ -303,7 +332,7 @@ class RefuseReasonModal(discord.ui.Modal, title="Raison du refus"):
             try:
                 embed_dm = discord.Embed(
                     title="❌ Candidature refusée",
-                    description="Désolé, votre candidature n'a pas été retenue, merci de réessayer plus tard.",
+                    description="Désolé, ta candidature n'a pas été retenue. N'hésite pas à retenter ta chance plus tard.",
                     color=0xE74C3C,
                     timestamp=datetime.now(UTC),
                 )
@@ -311,46 +340,42 @@ class RefuseReasonModal(discord.ui.Modal, title="Raison du refus"):
                 await member.send(embed=embed_dm)
             except discord.Forbidden:
                 pass
-            with contextlib.suppress(discord.Forbidden):
-                await member.kick(reason=f"Candidature refusee : {reason_text}")
         try:
             embed = interaction.message.embeds[0]
             embed.color = 0xE74C3C
-            embed.add_field(name="Refuse par", value=interaction.user.mention, inline=True)
+            embed.add_field(name="Refusée par", value=interaction.user.mention, inline=True)
             embed.add_field(name="📋 Raison", value=reason_text, inline=True)
             await interaction.message.edit(embed=embed, view=None)
         except Exception:
             with contextlib.suppress(Exception):
                 await interaction.message.edit(view=None)
-        await interaction.followup.send(
-            "✅ Candidature refusée et utilisateur kické.", ephemeral=True
-        )
+        await interaction.followup.send("✅ Candidature refusée.", ephemeral=True)
 
 
 async def _open_ticket_channel(
     interaction: discord.Interaction,
     db,
     *,
-    member_access: discord.Member | discord.User | None = None,
+    member_access: discord.Member | None = None,
 ) -> discord.TextChannel | None:
-    """Cree le salon `ticket-{N}` dans la categorie `Tickets`.
+    """Creates the `ticket-{N}` channel in the `Tickets` category.
 
-    Mutualise par les tickets Reports et Candidature Queue. Renvoie le salon
-    cree, ou `None` si l'operation echoue (dans ce cas l'utilisateur a deja
-    recu un message d'erreur ephemere via `followup`). L'appelant doit avoir
-    defer l'interaction au prealable (`defer(..., thinking=True)`).
+    Shared by Reports and Queue Application tickets. Returns the created
+    channel, or `None` if the operation fails (in that case the user has
+    already received an ephemeral error message via `followup`). The caller
+    must have deferred the interaction beforehand (`defer(..., thinking=True)`).
 
-    Si `member_access` est fourni (ex. Candidature Queue, ou le candidat est
-    identifie), le salon recoit des overwrites copies de la categorie + un
-    acces lecture/ecriture pour ce membre, afin qu'il puisse echanger avec le
-    staff dans SON ticket. Sans `member_access` (ex. Reports anonymes), le
-    salon reste synchronise avec la categorie : le createur n'a aucun acces
-    explicite et l'anonymat est preserve.
+    If `member_access` is provided (e.g. Queue Application, where the
+    candidate is identified), the channel inherits overwrites copied from
+    the category + read/write access for this member, so they can chat with
+    staff in THEIR ticket. Without `member_access` (e.g. anonymous Reports),
+    the channel stays synced with the category: the creator has no explicit
+    access and anonymity is preserved.
     """
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send(
-            "❌ Cette commande doit etre utilisee dans un serveur.",
+            "❌ Cette commande doit être utilisée dans un serveur.",
             ephemeral=True,
         )
         return None
@@ -361,16 +386,16 @@ async def _open_ticket_channel(
             category = await guild.create_category(TICKETS_CATEGORY_NAME)
         except discord.Forbidden:
             await interaction.followup.send(
-                "❌ Le bot n'a pas la permission **Gerer les salons** pour "
-                f"creer la categorie `{TICKETS_CATEGORY_NAME}`.",
+                "❌ Le bot n'a pas la permission **Gérer les salons** pour "
+                f"créer la catégorie `{TICKETS_CATEGORY_NAME}`.",
                 ephemeral=True,
             )
             return None
 
-    # Le compteur est incremente AVANT la creation du salon : si la creation
-    # echoue (Forbidden), le numero est "consomme" et il restera un trou dans
-    # la numerotation. C'est volontairement tolere - les trous dans les numeros
-    # de tickets sont inoffensifs et evitent une logique de rollback fragile.
+    # The counter is incremented BEFORE the channel is created: if creation
+    # fails (Forbidden), the number is "consumed" and a gap will remain in
+    # the ticket numbering. This is intentionally tolerated - gaps in ticket
+    # numbers are harmless and avoid fragile rollback logic.
     counter_doc = db["ticket_counters"].find_one_and_update(
         {"_id": str(guild.id)},
         {"$inc": {"counter": 1}},
@@ -380,10 +405,10 @@ async def _open_ticket_channel(
     next_number = int(counter_doc["counter"])
     channel_name = f"ticket-{next_number}"
 
-    # Pour un ticket identifie (Candidature Queue), on copie les overwrites de
-    # la categorie pour preserver sa config (staff / @everyone) puis on ajoute
-    # un acces dedie au candidat. Sans `member_access`, on laisse le salon se
-    # synchroniser avec la categorie (comportement des Reports anonymes).
+    # For an identified ticket (Queue Application), we copy the category's
+    # overwrites to preserve its config (staff / @everyone) and then add
+    # dedicated access for the candidate. Without `member_access`, we let
+    # the channel sync with the category (behavior of anonymous Reports).
     create_kwargs: dict = {"category": category}
     if member_access is not None:
         overwrites = dict(category.overwrites)
@@ -399,44 +424,44 @@ async def _open_ticket_channel(
         return await guild.create_text_channel(channel_name, **create_kwargs)
     except discord.Forbidden:
         await interaction.followup.send(
-            "❌ Le bot n'a pas la permission de creer le salon ticket.",
+            "❌ Le bot n'a pas la permission de créer le salon de ticket.",
             ephemeral=True,
         )
         return None
 
 
-class ReportModal(discord.ui.Modal, title="Envoyer un report anonyme"):
-    cible: discord.ui.TextInput = discord.ui.TextInput(
-        label="Qui report-tu ?",
+class ReportModal(discord.ui.Modal, title="Envoyer un signalement anonyme"):
+    target: discord.ui.TextInput = discord.ui.TextInput(
+        label="Qui signales-tu ?",
         placeholder="Pseudo Discord / @mention / ID du joueur",
         style=discord.TextStyle.short,
         required=True,
         max_length=200,
     )
     queue: discord.ui.TextInput = discord.ui.TextInput(
-        label="Dans quelle queue ?",
-        placeholder="Pro / Open / GC",
+        label="Dans quelle file ?",
+        placeholder="Open / Advanced",
         style=discord.TextStyle.short,
         required=True,
         max_length=50,
     )
-    raison: discord.ui.TextInput = discord.ui.TextInput(
+    reason: discord.ui.TextInput = discord.ui.TextInput(
         label="Pour quelle raison ?",
-        placeholder="Triche, toxicite, throw, insultes, AFK, etc.",
+        placeholder="Triche, toxicité, sabotage, insultes, AFK, etc.",
         style=discord.TextStyle.short,
         required=True,
         max_length=200,
     )
     details: discord.ui.TextInput = discord.ui.TextInput(
-        label="Details / contexte",
-        placeholder="Decris la situation : quand, ou, ce qu'il s'est passe...",
+        label="Détails / contexte",
+        placeholder="Décris la situation : quand, où, ce qu'il s'est passé...",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=1500,
     )
-    preuves: discord.ui.TextInput = discord.ui.TextInput(
-        label="Preuves (liens, clips, screens)",
-        placeholder="Colle ici les liens vers tes preuves (optionnel)",
+    evidence: discord.ui.TextInput = discord.ui.TextInput(
+        label="Preuves (liens, clips, captures)",
+        placeholder="Colle ici les liens vers tes preuves (facultatif)",
         style=discord.TextStyle.paragraph,
         required=False,
         max_length=1000,
@@ -454,57 +479,57 @@ class ReportModal(discord.ui.Modal, title="Envoyer un report anonyme"):
             return
 
         embed = discord.Embed(
-            title=f"🎫 Nouveau report - {ticket_channel.name}",
+            title=f"🎫 Nouveau signalement - {ticket_channel.name}",
             color=0xE67E22,
             timestamp=datetime.now(UTC),
         )
-        embed.add_field(name="Joueur reporte", value=self.cible.value, inline=False)
-        embed.add_field(name="Queue concernee", value=self.queue.value, inline=False)
-        embed.add_field(name="Raison", value=self.raison.value, inline=False)
-        embed.add_field(name="Details", value=self.details.value, inline=False)
-        if self.preuves.value.strip():
-            embed.add_field(name="Preuves", value=self.preuves.value, inline=False)
-        embed.set_footer(text="Report anonyme")
+        embed.add_field(name="Joueur signalé", value=self.target.value, inline=False)
+        embed.add_field(name="File concernée", value=self.queue.value, inline=False)
+        embed.add_field(name="Raison", value=self.reason.value, inline=False)
+        embed.add_field(name="Détails", value=self.details.value, inline=False)
+        if self.evidence.value.strip():
+            embed.add_field(name="Preuves", value=self.evidence.value, inline=False)
+        embed.set_footer(text="Signalement anonyme")
         try:
             await ticket_channel.send(embed=embed, view=self.close_view)
         except discord.HTTPException:
-            logger.exception("[ticket] envoi du message initial a leve")
+            logger.exception("[ticket] sending the initial message raised")
             await interaction.followup.send(
-                "❌ Une erreur est survenue lors de l'envoi de ton report.",
+                "❌ Une erreur est survenue lors de l'envoi de ton signalement.",
                 ephemeral=True,
             )
             return
 
         await interaction.followup.send(
-            f"✅ Ton report anonyme a ete envoye ({ticket_channel.mention}).",
+            f"✅ Ton signalement anonyme a bien été envoyé ({ticket_channel.mention}).",
             ephemeral=True,
         )
 
 
-class RankModal(discord.ui.Modal, title="Candidature de rank"):
-    """Ouvre un ticket de candidature de rank (candidat identifie).
+class RankModal(discord.ui.Modal, title="Candidature de file"):
+    """Opens a rank application ticket (identified candidate).
 
-    Pose 3 questions automatiquement puis cree un salon `ticket-{N}` dans la
-    categorie `Tickets` avec un embed recapitulatif + bouton de fermeture.
+    Asks 3 questions automatically and then creates a `ticket-{N}` channel
+    in the `Tickets` category with a summary embed + close button.
     """
 
     rank: discord.ui.TextInput = discord.ui.TextInput(
-        label="Pour quel rank souhaites-tu postuler ?",
-        placeholder="Pro Queue / Advanced Queue",
+        label="Pour quelle file postules-tu ?",
+        placeholder="Advanced Queue",
         style=discord.TextStyle.short,
         required=True,
         max_length=100,
     )
     tracker: discord.ui.TextInput = discord.ui.TextInput(
-        label="Le lien de ton tracker",
+        label="Ton lien tracker",
         placeholder="https://tracker.gg/valorant/profile/...",
         style=discord.TextStyle.short,
         required=True,
         max_length=300,
     )
     experience: discord.ui.TextInput = discord.ui.TextInput(
-        label="Ton experience en tournois/LANs et/ou VLR",
-        placeholder="Decris ton parcours competitif : tournois, LANs, equipes VLR...",
+        label="Ton expérience tournois/LAN et/ou VLR",
+        placeholder="Décris ton parcours compétitif : tournois, LAN, équipes VLR...",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=1500,
@@ -517,22 +542,30 @@ class RankModal(discord.ui.Modal, title="Candidature de rank"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        ticket_channel = await _open_ticket_channel(
-            interaction, self.db, member_access=interaction.user
-        )
+        # The Modal is only attached to interactions sent inside a guild,
+        # so `interaction.user` is a Member, not a User. Narrow explicitly
+        # for the typing layer and as a runtime safety net.
+        applicant = interaction.user
+        if not isinstance(applicant, discord.Member):
+            await interaction.followup.send(
+                "❌ Cette action doit être utilisée dans un serveur.",
+                ephemeral=True,
+            )
+            return
+        ticket_channel = await _open_ticket_channel(interaction, self.db, member_access=applicant)
         if ticket_channel is None:
             return
 
         embed = discord.Embed(
-            title=f"🎖️ Candidature Queue - {ticket_channel.name}",
+            title=f"🎖️ Candidature de file - {ticket_channel.name}",
             color=0x9B59B6,
             timestamp=datetime.now(UTC),
         )
         embed.add_field(name="Membre", value=interaction.user.mention, inline=False)
-        embed.add_field(name="Rank vise", value=self.rank.value, inline=False)
+        embed.add_field(name="File visée", value=self.rank.value, inline=False)
         embed.add_field(name="Tracker", value=self.tracker.value, inline=False)
         embed.add_field(
-            name="Experience (tournois / LANs / VLR)",
+            name="Expérience (tournois / LAN / VLR)",
             value=self.experience.value,
             inline=False,
         )
@@ -540,7 +573,7 @@ class RankModal(discord.ui.Modal, title="Candidature de rank"):
         try:
             await ticket_channel.send(embed=embed, view=self.close_view)
         except discord.HTTPException:
-            logger.exception("[ticket] envoi du message initial (rank) a leve")
+            logger.exception("[ticket] sending the initial message (rank) raised")
             await interaction.followup.send(
                 "❌ Une erreur est survenue lors de l'envoi de ta candidature.",
                 ephemeral=True,
@@ -548,21 +581,21 @@ class RankModal(discord.ui.Modal, title="Candidature de rank"):
             return
 
         await interaction.followup.send(
-            f"✅ Ta candidature de rank a ete envoyee ({ticket_channel.mention}).",
+            f"✅ Ta candidature de file a bien été envoyée ({ticket_channel.mention}).",
             ephemeral=True,
         )
 
 
 # ── Views ────────────────────────────────────────────────────────
 class ApplicationReviewView(discord.ui.View):
-    """Vue persistante : se reconstruit a partir de l'embed du message."""
+    """Persistent view: rebuilds itself from the message's embed."""
 
     def __init__(self, db) -> None:
         super().__init__(timeout=None)
         self.db = db
 
     @discord.ui.button(
-        label="Accepter",
+        label="Accept",
         style=discord.ButtonStyle.success,
         custom_id="application_accept",
     )
@@ -574,19 +607,46 @@ class ApplicationReviewView(discord.ui.View):
             )
             return
         await interaction.response.defer(ephemeral=True)
-        # 1) Valider AVANT le CAS (cf. audit : evite l'etat coince).
-        applicant_id, pseudo, is_staff = _parse_application_embed(interaction.message)
+
+        member, pseudo, is_staff, queue_tier = await self._validate_accept(interaction)
+        if member is None:
+            return
+        if not await self._claim_accept(interaction):
+            return
+
+        await self._update_accept_embed(interaction, member, pseudo)
+        await self._assign_accepted_roles(
+            interaction, member, is_staff=is_staff, queue_tier=queue_tier
+        )
+        await self._notify_accepted_member(member, pseudo)
+        await interaction.followup.send("✅ Candidature acceptée !", ephemeral=True)
+
+    async def _validate_accept(
+        self,
+        interaction: discord.Interaction,
+    ) -> tuple[discord.Member | None, str, bool, str | None]:
+        """Parse the embed and resolve the applicant.
+
+        Returns ``(member, pseudo, is_staff, queue_tier)``. ``member`` is
+        ``None`` when the embed is corrupted or the applicant has left the
+        guild — in both cases an error followup has already been sent.
+        """
+        applicant_id, pseudo, is_staff, queue_tier = _parse_application_embed(interaction.message)
         if applicant_id is None:
             await interaction.followup.send(
-                "❌ Donnees candidature illisibles (embed corrompu).",
+                "❌ Données de candidature illisibles (embed corrompu).",
                 ephemeral=True,
             )
-            return
+            return None, "", False, None
         member = interaction.guild.get_member(applicant_id)
         if not member:
             await interaction.followup.send("❌ Membre introuvable.", ephemeral=True)
-            return
-        # 2) CAS atomique
+            return None, "", False, None
+        return member, pseudo, is_staff, queue_tier
+
+    async def _claim_accept(self, interaction: discord.Interaction) -> bool:
+        """Atomic CAS preventing double-handling. Returns False (and sends
+        an error followup) if another admin already claimed this app."""
         claimed = repository.claim_application_decision(
             self.db,
             interaction.guild_id,
@@ -596,14 +656,25 @@ class ApplicationReviewView(discord.ui.View):
         )
         if not claimed:
             await interaction.followup.send(
-                "❌ Cette candidature a deja ete traitee par un autre admin.",
+                "❌ Cette candidature a déjà été traitée par un autre admin.",
                 ephemeral=True,
             )
-            return
+            return False
+        return True
+
+    async def _update_accept_embed(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        pseudo: str,
+    ) -> None:
+        """Rewrite the application embed to its accepted form. Best-effort."""
         try:
             old_embed = interaction.message.embeds[0] if interaction.message.embeds else None
             new_embed = discord.Embed(
-                title="📋 Candidature acceptée", color=0x2ECC71, timestamp=datetime.now(UTC)
+                title="📋 Candidature acceptée",
+                color=0x2ECC71,
+                timestamp=datetime.now(UTC),
             )
             new_embed.set_thumbnail(url=member.display_avatar.url)
             new_embed.add_field(name="👤 Membre", value=member.mention, inline=True)
@@ -611,51 +682,102 @@ class ApplicationReviewView(discord.ui.View):
             if old_embed:
                 for field in old_embed.fields:
                     if field.name in (
+                        QUEUE_TIER_FIELD_NAME,
                         "🔗 Tracker",
                         "🏆 Tournois / LAN",
                         "💼 Poste",
-                        "📋 Expériences",
+                        "📋 Expérience",
                         "Tracker",
                         "Tournois / LAN",
                         "Poste",
-                        "Experiences",
+                        "Expérience",
                     ):
                         new_embed.add_field(name=field.name, value=field.value, inline=False)
-            new_embed.add_field(name="✅ Accepté par", value=interaction.user.mention, inline=False)
+            new_embed.add_field(
+                name="✅ Acceptée par", value=interaction.user.mention, inline=False
+            )
             await interaction.message.edit(embed=new_embed, view=None)
         except Exception:
-            logger.exception("[accept] Edit impossible")
+            logger.exception("[accept] Edit failed")
             with contextlib.suppress(Exception):
                 await interaction.message.edit(view=None)
-        role_name = STAFF_ROLE if is_staff else PLAYERS_ROLE
+
+    async def _assign_accepted_roles(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        *,
+        is_staff: bool,
+        queue_tier: str | None,
+    ) -> None:
+        """Apply STAFF/PLAYERS + queue gating role. All best-effort."""
+        roles = interaction.guild.roles
+        await self._add_role_safe(
+            member, discord.utils.get(roles, name=STAFF_ROLE if is_staff else PLAYERS_ROLE), "Role"
+        )
+        if is_staff:
+            await self._add_role_safe(
+                member, discord.utils.get(roles, name=PLAYERS_ROLE), "Members role"
+            )
+        if queue_tier and not is_staff:
+            _, queue_role_name = QUEUE_TIERS[queue_tier]
+            await self._add_named_role_or_warn(
+                interaction, member, queue_role_name, "queue gating role"
+            )
+
+    async def _add_role_safe(
+        self,
+        member: discord.Member,
+        role: discord.Role | None,
+        label: str,
+    ) -> None:
+        """Add ``role`` if non-None; swallow errors."""
+        if role is None:
+            return
+        try:
+            await member.add_roles(role)
+        except Exception:
+            logger.exception("[accept] %s assignment failed", label)
+
+    async def _add_named_role_or_warn(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        role_name: str,
+        label: str,
+    ) -> None:
+        """Like ``_add_role_safe`` but emits a warning if the role is missing
+        on the guild (configuration error worth flagging in logs)."""
         role = discord.utils.get(interaction.guild.roles, name=role_name)
         if role:
             try:
                 await member.add_roles(role)
             except Exception:
-                logger.exception("[accept] Role impossible")
-        if is_staff:
-            members_role = discord.utils.get(interaction.guild.roles, name=PLAYERS_ROLE)
-            if members_role:
-                try:
-                    await member.add_roles(members_role)
-                except Exception:
-                    logger.exception("[accept] Role Members impossible")
+                logger.exception("[accept] %s assignment failed", label)
+            return
+        logger.warning(
+            "[accept] %s %r not found on guild %s; skipping",
+            label,
+            role_name,
+            interaction.guild_id,
+        )
+
+    async def _notify_accepted_member(self, member: discord.Member, pseudo: str) -> None:
+        """Rename to their declared pseudo + DM them an acceptance card."""
         with contextlib.suppress(Exception):
             await member.edit(nick=pseudo)
         with contextlib.suppress(discord.Forbidden):
             await member.send(
                 embed=discord.Embed(
                     title="🎉 Candidature acceptée !",
-                    description="Bravo, vous avez été accepté, vous pouvez désormais faire des 10mans !",
+                    description="Félicitations, tu as été accepté(e), tu peux désormais jouer aux 10mans !",
                     color=0x2ECC71,
                     timestamp=datetime.now(UTC),
                 )
             )
-        await interaction.followup.send("✅ Candidature acceptée !", ephemeral=True)
 
     @discord.ui.button(
-        label="Refuser",
+        label="Decline",
         style=discord.ButtonStyle.danger,
         custom_id="application_refuse",
     )
@@ -666,10 +788,12 @@ class ApplicationReviewView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        applicant_id, _pseudo, _is_staff = _parse_application_embed(interaction.message)
+        applicant_id, _pseudo, _is_staff, _queue_tier = _parse_application_embed(
+            interaction.message
+        )
         if applicant_id is None:
             await interaction.response.send_message(
-                "❌ Donnees candidature illisibles (embed corrompu).",
+                "❌ Données de candidature illisibles (embed corrompu).",
                 ephemeral=True,
             )
             return
@@ -678,66 +802,94 @@ class ApplicationReviewView(discord.ui.View):
         )
 
 
-class RoleChoiceView(discord.ui.View):
-    """Vue ephemere (timeout = APPLICATION_VIEW_TIMEOUT_SECONDS) : Joueur vs Staff."""
+def _candidature_cooldown_remaining(db, user_id: str) -> float:
+    """Returns seconds remaining on the candidature cooldown for user_id,
+    or 0.0 if the user can apply now. Non-atomic peek — the atomic claim
+    happens in ApplicationModal/StaffModal.on_submit so that abandoning
+    the modal does not consume the cooldown."""
+    doc = db["candidature_cooldowns"].find_one({"_id": user_id})
+    if not doc:
+        return 0.0
+    last = doc["last_apply"]
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    diff = datetime.now(UTC) - last
+    elapsed = diff.total_seconds()
+    if elapsed >= CANDIDATURE_COOLDOWN_SECONDS:
+        return 0.0
+    return CANDIDATURE_COOLDOWN_SECONDS - elapsed
 
-    def __init__(self, db, review_view: ApplicationReviewView) -> None:
-        super().__init__(timeout=APPLICATION_VIEW_TIMEOUT_SECONDS)
-        self.db = db
-        self.review_view = review_view
 
-    @discord.ui.button(label="Joueur", style=discord.ButtonStyle.primary)
-    async def joueur_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            ApplicationModal(db=self.db, review_view=self.review_view)
-        )
-
-    @discord.ui.button(label="Coach / Analyst / Manager", style=discord.ButtonStyle.secondary)
-    async def staff_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(StaffModal(db=self.db, review_view=self.review_view))
+def _cooldown_message(remaining: float) -> str:
+    minutes = int(remaining // 60)
+    seconds = int(remaining % 60)
+    return f"⏳ Tu as déjà postulé récemment ! Réessaie dans **{minutes}min {seconds}s**."
 
 
 class WelcomeView(discord.ui.View):
-    """Vue persistante : bouton Postuler dans #verify."""
+    """Persistent view in #verify: an Apply button for the gated Advanced
+    queue, an instant-access Open queue button, and a
+    Coach/Analyst/Manager button. The Advanced button opens an
+    ApplicationModal tagged with its queue so the gating role can be
+    auto-assigned on accept."""
 
     def __init__(self, db, review_view: ApplicationReviewView) -> None:
         super().__init__(timeout=None)
         self.db = db
         self.review_view = review_view
 
+    async def _send_application_modal(
+        self, interaction: discord.Interaction, queue_tier: str
+    ) -> None:
+        remaining = _candidature_cooldown_remaining(self.db, str(interaction.user.id))
+        if remaining > 0:
+            await interaction.response.send_message(_cooldown_message(remaining), ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            ApplicationModal(db=self.db, review_view=self.review_view, queue_tier=queue_tier)
+        )
+
     @discord.ui.button(
-        label="Postuler", style=discord.ButtonStyle.primary, custom_id="postuler_btn"
+        label="Postuler File Advanced",
+        style=discord.ButtonStyle.primary,
+        custom_id="welcome_apply_advanced",
+        row=0,
     )
-    async def postuler(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Peek non-atomique : on ne consomme pas le cooldown ici (sinon
-        # l'utilisateur qui ferme le modal sans submit serait bloque 1h
-        # pour rien). Le vrai claim atomique a lieu dans
-        # ApplicationModal/StaffModal.on_submit.
-        uid = str(interaction.user.id)
-        doc = self.db["candidature_cooldowns"].find_one({"_id": uid})
-        if doc:
-            last = doc["last_apply"]
-            if last.tzinfo is None:
-                last = last.replace(tzinfo=UTC)
-            diff = datetime.now(UTC) - last
-            if diff.total_seconds() < CANDIDATURE_COOLDOWN_SECONDS:
-                remaining = CANDIDATURE_COOLDOWN_SECONDS - diff.total_seconds()
-                minutes = int(remaining // 60)
-                seconds = int(remaining % 60)
-                await interaction.response.send_message(
-                    f"⏳ Tu as déjà postulé récemment ! Réessaie dans **{minutes}min {seconds}s**.",
-                    ephemeral=True,
-                )
-                return
+    async def apply_advanced(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_application_modal(interaction, "advanced")
+
+    @discord.ui.button(
+        label="Rejoindre la File Open",
+        style=discord.ButtonStyle.success,
+        custom_id="welcome_apply_open",
+        row=0,
+    )
+    async def apply_open(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """La file Open est libre d'accès (aucun rôle requis) : ce bouton
+        confirme simplement à l'utilisateur qu'il peut rejoindre la file
+        Open, sans attribuer de rôle de file."""
         await interaction.response.send_message(
-            "## Pour quel poste souhaites-tu postuler ? 🎮",
-            view=RoleChoiceView(db=self.db, review_view=self.review_view),
+            "✅ La **file Open** est ouverte à tous : rends-toi sur "
+            "`#open-queue` pour lancer une recherche de partie.",
             ephemeral=True,
         )
 
+    @discord.ui.button(
+        label="Coach / Analyste / Manager",
+        style=discord.ButtonStyle.secondary,
+        custom_id="welcome_apply_staff",
+        row=1,
+    )
+    async def apply_staff(self, interaction: discord.Interaction, button: discord.ui.Button):
+        remaining = _candidature_cooldown_remaining(self.db, str(interaction.user.id))
+        if remaining > 0:
+            await interaction.response.send_message(_cooldown_message(remaining), ephemeral=True)
+            return
+        await interaction.response.send_modal(StaffModal(db=self.db, review_view=self.review_view))
+
 
 class CloseTicketView(discord.ui.View):
-    """Vue persistante : un bouton 'Fermer le ticket' qui supprime le salon."""
+    """Persistent view: a 'Close ticket' button that deletes the channel."""
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
@@ -761,7 +913,7 @@ class CloseTicketView(discord.ui.View):
                 ephemeral=True,
             )
         try:
-            await channel.delete(reason=f"Ticket ferme par {interaction.user}")
+            await channel.delete(reason=f"Ticket closed by {interaction.user}")
         except discord.NotFound:
             pass
         except discord.Forbidden:
@@ -771,11 +923,11 @@ class CloseTicketView(discord.ui.View):
                     ephemeral=True,
                 )
         except discord.HTTPException:
-            logger.exception("[ticket] suppression du salon a leve")
+            logger.exception("[ticket] deleting the channel raised")
 
 
 class ReportView(discord.ui.View):
-    """Vue persistante : un bouton 'Report' qui ouvre le ReportModal."""
+    """Persistent view: a 'Report' button that opens the ReportModal."""
 
     def __init__(self, db, close_view: CloseTicketView) -> None:
         super().__init__(timeout=None)
@@ -783,7 +935,7 @@ class ReportView(discord.ui.View):
         self.close_view = close_view
 
     @discord.ui.button(
-        label="Report",
+        label="Signalement",
         style=discord.ButtonStyle.danger,
         custom_id="report_open_btn",
     )
@@ -792,10 +944,10 @@ class ReportView(discord.ui.View):
 
 
 class TicketPanelView(discord.ui.View):
-    """Vue persistante : panel d'ouverture de ticket a 2 options.
+    """Persistent view: ticket opening panel with 2 options.
 
-    - **Reports** -> ReportModal (signalement anonyme).
-    - **Ranks**   -> RankModal (candidature de rank, candidat identifie).
+    - **Reports** -> ReportModal (anonymous report).
+    - **Ranks**   -> RankModal (rank application, identified candidate).
     """
 
     def __init__(self, db, close_view: CloseTicketView) -> None:
@@ -804,7 +956,7 @@ class TicketPanelView(discord.ui.View):
         self.close_view = close_view
 
     @discord.ui.button(
-        label="Reports",
+        label="Signalements",
         style=discord.ButtonStyle.danger,
         custom_id="ticket_panel_reports_btn",
     )
@@ -812,7 +964,7 @@ class TicketPanelView(discord.ui.View):
         await interaction.response.send_modal(ReportModal(db=self.db, close_view=self.close_view))
 
     @discord.ui.button(
-        label="Candidature Queue",
+        label="Candidature de file",
         style=discord.ButtonStyle.primary,
         custom_id="ticket_panel_ranks_btn",
     )
@@ -842,15 +994,23 @@ class ApplicationsCog(commands.Cog):
             await interaction.response.send_message("Salon verify introuvable.", ephemeral=True)
             return
         embed = discord.Embed(
-            title="Bienvenu sur The Hub Matchmaking",
-            description="Bienvenue sur un serveur de **10mans français** avec 3 queues :\n\n• **Pro Queue** - TOP VRC\n• **Open Queue** - Immortal peak\n• **GC Queue** - Ascendant peak\n\nPour pouvoir accéder au serveur, merci de cliquer sur le bouton **Postuler** juste en dessous.\n\n**Amusez-vous ! 🍀**",
+            title="Bienvenue sur le Matchmaking de The Hub",
+            description=(
+                "Bienvenue sur un serveur **10mans** avec 2 files :\n\n"
+                "• **File Open** - Ouverte à tous\n"
+                "• **File Advanced** - Sur candidature\n\n"
+                "Clique sur le bouton correspondant à la file que tu veux rejoindre. "
+                "La **file Open** est libre d'accès ; la **file Advanced** "
+                "passe par une rapide validation du staff.\n\n"
+                "**Amuse-toi bien ! 🍀**"
+            ),
             color=0x5865F2,
             timestamp=datetime.now(UTC),
         )
         embed.set_footer(text=interaction.guild.name)
         await channel.send(embed=embed, view=self.welcome_view)
         await interaction.response.send_message(
-            f"Message envoye dans {channel.mention} !", ephemeral=True
+            f"Message envoyé dans {channel.mention} !", ephemeral=True
         )
 
     @welcome.error
@@ -862,14 +1022,14 @@ class ApplicationsCog(commands.Cog):
 
     @app_commands.command(
         name="report",
-        description="Poste le panel d'ouverture de ticket (Reports / Ranks) dans ce salon",
+        description="Affiche le panneau d'ouverture de ticket (Signalements / Candidatures) ici",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def report(self, interaction: discord.Interaction) -> None:
         channel = interaction.channel
         if channel is None or not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message(
-                "❌ Cette commande doit etre utilisee dans un salon textuel.",
+                "❌ Cette commande doit être utilisée dans un salon textuel.",
                 ephemeral=True,
             )
             return
@@ -877,13 +1037,13 @@ class ApplicationsCog(commands.Cog):
             title="🎫 Ouvrir un ticket",
             description=(
                 "Choisis le type de ticket que tu souhaites ouvrir :\n\n"
-                "**Reports** - Signaler un joueur (triche, toxicite, throw, "
-                "insultes, AFK...). Ton report est anonyme : ton identite "
-                "n'est pas revelee au staff.\n\n"
-                "**Candidature Queue** - Postuler pour une queue privée. On te "
-                "demandera la queue visée dont les critères sont :\n"
-                "• Pro Queue : 600rr Peak récent ou 5 lignes VLR 2025/2026\n"
-                "• Advanced Queue : Immo 3 actuel ou sur invitation"
+                "**Signalements** - Signale un joueur (triche, toxicité, "
+                "sabotage, insultes, AFK...). Ton signalement est anonyme : "
+                "ton identité n'est pas révélée au staff.\n\n"
+                "**Candidature de file** - Postule pour une file privée. Nous "
+                "te demanderons quelle file tu vises, les critères sont :\n"
+                "• File Advanced : sur candidature\n"
+                "• File Open : ouverte à tous"
             ),
             color=0x5865F2,
             timestamp=datetime.now(UTC),
@@ -891,7 +1051,7 @@ class ApplicationsCog(commands.Cog):
         embed.set_footer(text=interaction.guild.name if interaction.guild else "Tickets")
         await channel.send(embed=embed, view=self.ticket_panel_view)
         await interaction.response.send_message(
-            f"Message envoye dans {channel.mention} !",
+            f"Message envoyé dans {channel.mention} !",
             ephemeral=True,
         )
 
@@ -899,7 +1059,7 @@ class ApplicationsCog(commands.Cog):
     async def _report_error(self, interaction: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
             await interaction.response.send_message(
-                "🚫 Reservé aux administrateurs.",
+                "🚫 Réservé aux administrateurs.",
                 ephemeral=True,
             )
 
@@ -907,13 +1067,12 @@ class ApplicationsCog(commands.Cog):
 async def setup(bot: commands.Bot, db) -> None:
     cog = ApplicationsCog(bot, db)
     await bot.add_cog(cog)
-    # Enregistre les vues persistantes (apres restart, leurs custom_id
-    # doivent etre routables par le bot meme sans instance de message).
+    # Register persistent views (after restart, their custom_ids must be
+    # routable by the bot even without a message instance).
     bot.add_view(cog.review_view)
     bot.add_view(cog.welcome_view)
     bot.add_view(cog.close_view)
     bot.add_view(cog.ticket_panel_view)
-    # Conserve pour router les anciens panels "Report" deja postes (custom_id
-    # report_open_btn) apres restart ; les nouveaux panels utilisent
-    # ticket_panel_view.
+    # Kept to route the old "Report" panels already posted (custom_id
+    # report_open_btn) after restart; new panels use ticket_panel_view.
     bot.add_view(cog.report_view)

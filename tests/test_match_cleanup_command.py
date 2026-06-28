@@ -90,9 +90,9 @@ async def test_match_cleanup_happy_path(monkeypatch):
     delete_mock.assert_awaited_once()
     assert delete_mock.await_args.kwargs["category_id"] == 4242
 
-    # update_one est appele deux fois : (1) mark_match_cleanup_started
-    # qui pose delete_started_at avant l'appel Discord, (2) la
-    # transition de status terminale.
+    # update_one is called twice: (1) mark_match_cleanup_started which
+    # sets delete_started_at before the Discord call, (2) the terminal
+    # status transition.
     assert cog.db["matches"].update_one.call_count == 2
     cleanup_started_call, status_call = cog.db["matches"].update_one.call_args_list
     assert "delete_started_at" in cleanup_started_call.args[1]["$set"]
@@ -103,8 +103,8 @@ async def test_match_cleanup_happy_path(monkeypatch):
 
 
 def test_resolve_match_id_converts_hex_and_falls_back():
-    """L'hex string d'un ObjectId doit etre convertie ; toute autre
-    valeur est renvoyee telle quelle (compat docs legacy a _id string)."""
+    """The ObjectId hex string must be converted; any other value is
+    returned as is (compat with legacy docs whose _id is a string)."""
     from bson import ObjectId
 
     from cogs.match._cog import MatchCog
@@ -118,9 +118,10 @@ def test_resolve_match_id_converts_hex_and_falls_back():
 
 @pytest.mark.asyncio
 async def test_match_cleanup_queries_by_objectid(monkeypatch):
-    """Regression : un match reel (cree via repository.create_match) a un
-    _id ObjectId. La commande doit convertir l'hex saisie en ObjectId,
-    sinon find_one ne matche jamais et le match reste 'introuvable'."""
+    """Regression: a real match (created via repository.create_match) has
+    an ObjectId _id. The command must convert the typed hex into an
+    ObjectId, otherwise find_one never matches and the match stays
+    "not found"."""
     from bson import ObjectId
 
     from cogs.match import _cog as match_cog_module
@@ -137,10 +138,10 @@ async def test_match_cleanup_queries_by_objectid(monkeypatch):
 
     await cog.match_cleanup.callback(cog, interaction, match_id=str(oid))
 
-    # find_one doit etre interroge avec un ObjectId, pas l'hex string brute.
+    # find_one must be queried with an ObjectId, not the raw hex string.
     find_call = cog.db["matches"].find_one.call_args
     assert find_call.args[0] == {"_id": oid}
     assert isinstance(find_call.args[0]["_id"], ObjectId)
-    # Les operations suivantes ciblent le vrai _id du doc trouve.
+    # Subsequent operations target the real _id of the found doc.
     status_call = cog.db["matches"].update_one.call_args_list[-1]
     assert status_call.args[0] == {"_id": oid}

@@ -1,22 +1,22 @@
-"""Helpers Riot ID. Logique pure (pas de Discord ni Mongo)."""
+"""Riot ID helpers. Pure logic (no Discord nor Mongo)."""
 
 from __future__ import annotations
 
 
 def parse_riot_id(riot_id: str) -> tuple[str, str]:
     """
-    Parse "Pseudo#TAG" -> ("Pseudo", "TAG"). Tolere les espaces dans le pseudo.
+    Parse "Name#TAG" -> ("Name", "TAG"). Tolerates spaces in the name.
 
     Raises:
-        ValueError si le format est invalide.
+        ValueError if the format is invalid.
     """
     if not isinstance(riot_id, str) or "#" not in riot_id:
-        raise ValueError("Format invalide. Attendu : Pseudo#TAG")
+        raise ValueError("Invalid format. Expected: Name#TAG")
     name, _, tag = riot_id.rpartition("#")
     name = name.strip()
     tag = tag.strip()
     if not name or not tag:
-        raise ValueError("Format invalide. Attendu : Pseudo#TAG")
+        raise ValueError("Invalid format. Expected: Name#TAG")
     if len(tag) > 5 or len(name) > 16:
-        raise ValueError("Pseudo trop long (max 16) ou tag trop long (max 5)")
+        raise ValueError("Name too long (max 16) or tag too long (max 5)")
     return name, tag

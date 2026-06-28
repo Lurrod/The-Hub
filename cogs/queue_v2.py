@@ -1,27 +1,26 @@
 """
-Cog V2 : queues 10mans avec boutons persistants (Rejoindre / Quitter).
+Cog V2 : files 10mans avec boutons persistants (Rejoindre / Quitter).
 
-3 queues simultanees par guild :
-  - Pro Queue : reserve aux joueurs avec le role "Rank S | Pro Queue".
-  - Open Queue : sans gate de role.
-  - GC Queue : reserve aux joueurs avec le role "GC".
+2 files simultanées par serveur :
+  - File Open : ouverte à tous (aucune restriction de rôle).
+  - File Advanced : réservée aux joueurs ayant le rôle "Rank Q | Advanced Queue".
 
 Invariants :
-  - Un joueur ne peut etre que dans UNE queue a la fois (single-queue lock).
-  - Chaque queue a son salon vocal "Waiting Room" dedie.
-  - Les custom_ids des boutons portent le `queue_type` pour permettre la
-    cohabitation des 3 messages persistants apres restart du bot.
+  - Un joueur ne peut être que dans UNE seule file à la fois (verrou mono-file).
+  - Chaque file a son salon vocal "Waiting Room" dédié.
+  - Les custom_ids des boutons incluent le `queue_type` afin que les
+    messages persistants puissent coexister après un redémarrage du bot.
 
-Flux :
-  1. Admin lance /setup-queue queue:<Pro|Open|GC> dans un salon -> message
-     persistant pose pour ce type.
-  2. Joueurs cliquent "Rejoindre" / "Quitter".
-     - Refus si pas de compte Riot lie.
-     - Refus si deja dans un match en cours.
-     - Refus si deja dans une autre queue.
-     - Refus si role gate non satisfait.
-  3. A 10 joueurs : status passe a "forming", _on_full() est appele avec
-     `queue_type` pour permettre au cog match de propager l'info.
+Déroulement :
+  1. Un admin lance /setup-queue queue:<Open|Advanced> dans un salon ->
+     un message persistant est posté pour ce type.
+  2. Les joueurs cliquent sur "Rejoindre" / "Quitter".
+     - Refusé si aucun compte Riot n'est lié.
+     - Refusé si déjà dans un match en cours.
+     - Refusé si déjà dans une autre file.
+     - Refusé si le rôle requis n'est pas satisfait.
+  3. À 10 joueurs : le statut passe à "forming", _on_full() est appelé
+     avec `queue_type` pour laisser le cog de match propager l'info.
 """
 
 from __future__ import annotations
@@ -39,63 +38,43 @@ from discord.ext import commands
 
 from services import repository
 
-
-# Roles "Match #1", "Match #2", "Match #3", "Match #4", "Match #5" attribues a un joueur en cours
-# de match. Tant qu'un joueur a un de ces roles, il est dans un match
+# Roles "Match #1", "Match #2", "Match #3", "Match #4", "Match #5" are assigned to a
+# player currently in a match. As long as a player has one of these roles, they are in a match.
 logger = logging.getLogger(__name__)
 
 
-# ── Constantes par queue_type ─────────────────────────────────────
-# Salons vocaux "Waiting Room" dedies par queue.
+# ── Per queue_type constants ──────────────────────────────────────
+# Dedicated "Waiting Room" voice channels per queue.
 WAITING_ROOM_NAMES: dict[str, str] = {
-    "pro": "Waiting Room Pro",
     "open": "Waiting Room Open",
-    "gc": "Waiting Room GC",
+    "advanced": "Waiting Room Advanced",
 }
 
-# Roles autorises pour rejoindre une queue gated (n'importe lequel suffit).
-# None = pas de gate.
+# Allowed roles to join a gated queue (any one of them is enough).
+# None = no gate.
 QUEUE_ROLE_GATES: dict[str, tuple[str, ...] | None] = {
-    "pro": ("Rank S | Pro Queue",),
     "open": None,
-    "gc": ("GC",),
+    "advanced": ("Rank Q | Advanced Queue",),
 }
 
-# Nom du salon textuel attendu pour chaque queue (utilise par /setup
-# pour pre-poster les messages dans les bons salons).
+# Expected text channel name for each queue (used by /setup to
+# pre-post messages in the right channels).
 QUEUE_CHANNEL_NAMES: dict[str, str] = {
-    "pro": "pro-queue",
     "open": "open-queue",
-    "gc": "gc-queue",
+    "advanced": "advanced-queue",
 }
 
-# Label affiche dans le titre de l'embed.
+# Label displayed in the embed title.
 QUEUE_LABELS: dict[str, str] = {
-    "pro": "Pro Queue",
     "open": "Open Queue",
-    "gc": "GC Queue",
+    "advanced": "Advanced Queue",
 }
 
-QUEUE_ROLE_NAME: str = "En Queue"  # role global, partage entre les 3 queues
+QUEUE_ROLE_NAME: str = "En Queue"  # global role, shared between all queues
 QUEUE_SIZE: int = 10
 
 
-# ── Roles helpers (inchanges) ─────────────────────────────────────
-async def _grant_queue_role(member: discord.Member) -> str | None:
-    role = discord.utils.get(member.guild.roles, name=QUEUE_ROLE_NAME)
-    if role is None:
-        return f"⚠️ Role **{QUEUE_ROLE_NAME}** introuvable sur le serveur."
-    if role in member.roles:
-        return None
-    try:
-        await member.add_roles(role, reason="Joined queue")
-    except discord.Forbidden:
-        return f"⚠️ Permissions insuffisantes pour ajouter le role **{QUEUE_ROLE_NAME}**."
-    except discord.HTTPException:
-        return None
-    return None
-
-
+# ── Role helpers (unchanged) ──────────────────────────────────────
 async def _revoke_queue_role(member: discord.Member) -> None:
     role = discord.utils.get(member.guild.roles, name=QUEUE_ROLE_NAME)
     if role is None or role not in member.roles:
@@ -108,11 +87,11 @@ async def _move_to_waiting_room(
     member: discord.Member,
     queue_type: str,
 ) -> str | None:
-    """Deplace `member` dans le salon vocal "Waiting Room <type>" si possible.
+    """Move `member` into the "Waiting Room <type>" voice channel if possible.
 
-    Retourne un message d'info pour le joueur, ou None si tout s'est bien passe
-    silencieusement. Discord n'autorise le deplacement que si le membre est deja
-    connecte a un salon vocal du serveur.
+    Returns an info message for the player, or None if everything went
+    silently well. Discord only allows moving a member who is already
+    connected to a voice channel on the server.
     """
     waiting_name = WAITING_ROOM_NAMES[queue_type]
     waiting = discord.utils.get(member.guild.voice_channels, name=waiting_name)
@@ -174,13 +153,13 @@ def build_queue_embed(
     return embed
 
 
-# ── View persistante ──────────────────────────────────────────────
+# ── Persistent view ───────────────────────────────────────────────
 _LOCKS_MAXSIZE: int = 128
 
 
-# Types de retour internes pour decouper `_join_callback` :
-#   _JoinFailure  -> motif d'echec (message ephemeral a renvoyer au joueur)
-#   _JoinSuccess  -> slot acquis, queue_doc a jour, drapeau de queue pleine
+# Internal return types to split up `_join_callback`:
+#   _JoinFailure  -> failure reason (ephemeral message to send to the player)
+#   _JoinSuccess  -> slot acquired, updated queue_doc, full-queue flag
 @dataclass(frozen=True)
 class _JoinFailure:
     message: str
@@ -196,11 +175,11 @@ _JoinResult = _JoinFailure | _JoinSuccess
 
 
 class QueueView(discord.ui.View):
-    """View persistante par `queue_type`. Custom IDs distincts pour cohabiter.
+    """Persistent view per `queue_type`. Distinct custom IDs to coexist.
 
-    Les boutons sont crees manuellement (pas via `@discord.ui.button`)
-    parce que le `custom_id` doit dependre de `queue_type` connu au
-    runtime, pas du decorateur fige a l'import du module.
+    Buttons are created manually (not via `@discord.ui.button`)
+    because the `custom_id` must depend on `queue_type` known at
+    runtime, not on the decorator frozen at module import time.
     """
 
     def __init__(self, db, queue_type: str, on_full=None) -> None:
@@ -208,18 +187,18 @@ class QueueView(discord.ui.View):
         self.db = db
         self.queue_type = queue_type
         self._on_full = on_full
-        # OrderedDict + LRU bornee pour eviter une fuite memoire sur bot
-        # multi-guilds longue duree (1 Lock par guild_id, jamais purge).
+        # OrderedDict + bounded LRU to avoid a memory leak on a long-running
+        # multi-guild bot (1 Lock per guild_id, never purged).
         self._locks: OrderedDict[int, asyncio.Lock] = OrderedDict()
-        # Refs fortes sur les tasks de formation de match (`_safe_on_full`).
-        # Sans ca, Python peut GC la task avant qu'elle finisse
-        # (cf. docs asyncio.create_task : "Save a reference to the result
+        # Strong refs on match-formation tasks (`_safe_on_full`).
+        # Without this, Python may GC the task before it finishes
+        # (cf. asyncio.create_task docs: "Save a reference to the result
         # of this function, to avoid a task disappearing mid-execution").
-        # Le `done_callback` discard l'entree au terme de la task pour
-        # eviter la fuite memoire sur bot longue duree.
+        # The `done_callback` discards the entry at task completion to
+        # avoid a memory leak on a long-running bot.
         self._bg_tasks: set[asyncio.Task[None]] = set()
 
-        # Boutons a custom_id dynamique (per-instance).
+        # Buttons with dynamic custom_id (per-instance).
         join: discord.ui.Button = discord.ui.Button(
             label="Rejoindre",
             style=discord.ButtonStyle.success,
@@ -253,13 +232,13 @@ class QueueView(discord.ui.View):
         self,
         member: discord.Member,
     ) -> tuple[bool, str | None]:
-        """Verifie le gate de role pour cette queue.
+        """Check the role gate for this queue.
 
         Returns:
-            (True, None) si la queue n'a pas de gate (open).
-            (True, role_name) si le gate est satisfait.
-            (False, role_name) si le gate n'est pas satisfait. Le role_name
-            est utilise par le caller pour le message d'erreur.
+            (True, None) if the queue has no gate (open).
+            (True, role_name) if the gate is satisfied.
+            (False, role_name) if the gate is not satisfied. The role_name
+            is used by the caller for the error message.
         """
         required = QUEUE_ROLE_GATES.get(self.queue_type)
         if required is None:
@@ -271,8 +250,8 @@ class QueueView(discord.ui.View):
         return False, label
 
     async def _join_callback(self, inter: discord.Interaction):
-        # Acquitte tout de suite : sous contention du lock par-guild, le token
-        # d'interaction (3s) peut expirer avant qu'on reponde -> 10062.
+        # Acknowledge immediately: under per-guild lock contention, the
+        # interaction token (3s) may expire before we reply -> 10062.
         try:
             await inter.response.defer()
         except discord.NotFound:
@@ -290,34 +269,31 @@ class QueueView(discord.ui.View):
 
         await self._broadcast_join_side_effects(inter, result.queue_doc, result.full)
 
-    # ── helpers _join_callback ───────────────────────────────────
+    # ── _join_callback helpers ───────────────────────────────────
     def _pre_lock_checks(self, inter: discord.Interaction) -> str | None:
-        """Validations synchrones hors lock (type membre + role gate).
+        """Synchronous validations outside the lock (member type + role gate).
 
-        Retourne le message d'erreur ephemeral a envoyer, ou None si tout
-        est OK et que l'appelant peut acquerir le lock + interroger la BDD.
-        Pure : pas d'I/O DB ni Discord ici, juste de la logique sur l'objet
-        Interaction. Testable sans mongomock ni dpytest.
+        Returns the ephemeral error message to send, or None if everything
+        is OK and the caller can acquire the lock + query the DB.
+        Pure: no DB or Discord I/O here, just logic on the Interaction
+        object. Testable without mongomock or dpytest.
         """
         if not isinstance(inter.user, discord.Member):
-            return "❌ Interaction invalide (hors serveur ou type d'utilisateur inattendu)."
+            return "❌ Interaction invalide (hors d'un serveur ou type d'utilisateur inattendu)."
         ok, required = self._has_required_role(inter.user)
         if not ok:
-            return (
-                f"❌ Cette queue est reservee aux joueurs avec le role "
-                f"**{required}**."
-            )
+            return f"❌ Cette file est réservée aux joueurs ayant le rôle **{required}**."
         return None
 
     async def _acquire_slot_under_lock(self, inter: discord.Interaction) -> _JoinResult:
-        """Toute la phase BDD sous le lock par-guild.
+        """All DB phase under the per-guild lock.
 
-        Couvre : lecture compte Riot + queue courante, insert atomique,
-        fermeture queue pleine. Renvoie un `_JoinSuccess(queue_doc, full)`
-        ou un `_JoinFailure(message)` que l'appelant pousse en ephemeral.
-        Le lock est relache a la sortie de cette methode : les
-        side-effects Discord (VC move, role grant, edit message) tournent
-        ensuite sans serialisation.
+        Covers: Riot account read + current queue read, atomic insert,
+        queue-full close. Returns `_JoinSuccess(queue_doc, full)` or
+        `_JoinFailure(message)` that the caller sends as ephemeral.
+        The lock is released on exit from this method: Discord
+        side-effects (VC move, role grant, message edit) then run
+        without serialization.
         """
         async with self._lock(inter.guild_id):
             riot, current = await asyncio.gather(
@@ -334,20 +310,20 @@ class QueueView(discord.ui.View):
                 ),
             )
             if not riot:
-                return _JoinFailure("❌ Lie d'abord ton compte Riot avec `/link-riot Pseudo#TAG`.")
+                return _JoinFailure("❌ Lie d'abord ton compte Riot avec `/link-riot Name#TAG`.")
             if current is not None and current != self.queue_type:
                 return _JoinFailure(
-                    f"❌ Tu es deja dans la queue **{current.upper()}**. "
-                    "Quitte-la d'abord pour rejoindre une autre queue."
+                    f"❌ Tu es déjà dans la file **{current.upper()}**. "
+                    "Quitte-la d'abord pour rejoindre une autre file."
                 )
 
-            # Gate anti-doublon : refuse si le joueur est encore engage dans un
-            # match dont la categorie Discord n'a pas ete supprimee (pending,
-            # validated_*, contested et ELO non applique). Sans cette garde, un
-            # joueur en plein match pourrait remplir une seconde queue et
-            # demarrer un 2e match en parallele. Skip sur re-click idempotent
-            # (`current == self.queue_type`) : impossible logiquement et evite
-            # une requete Mongo inutile.
+            # Anti-duplicate gate: refuse if the player is still engaged in a
+            # match whose Discord category has not been deleted (pending,
+            # validated_*, contested and ELO not applied). Without this
+            # guard, a player in an ongoing match could fill a second queue
+            # and start a 2nd parallel match. Skip on idempotent re-click
+            # (`current == self.queue_type`): impossible logically and
+            # avoids an unnecessary Mongo query.
             if current != self.queue_type:
                 active_match = await asyncio.to_thread(
                     repository.find_active_match_for_player,
@@ -358,8 +334,8 @@ class QueueView(discord.ui.View):
                     match_num = active_match.get("match_number")
                     suffix = f" (**Match #{match_num}**)" if match_num else ""
                     return _JoinFailure(
-                        f"❌ Tu es deja dans un match en cours{suffix}. "
-                        "Termine le vote ou demande l'annulation a un admin."
+                        f"❌ Tu es déjà dans un match en cours{suffix}. "
+                        "Termine le vote ou demande à un admin de l'annuler."
                     )
 
             res = await asyncio.to_thread(
@@ -375,7 +351,7 @@ class QueueView(discord.ui.View):
             queue_doc = res.queue
             full = len(queue_doc.get("players", [])) >= QUEUE_SIZE
             if full:
-                # find_one_and_update renvoie le doc mis a jour : 1 round-trip.
+                # find_one_and_update returns the updated doc: 1 round-trip.
                 closed = await asyncio.to_thread(
                     repository.close_active_queue,
                     self.db,
@@ -392,36 +368,32 @@ class QueueView(discord.ui.View):
         queue_doc: dict,
         full: bool,
     ) -> None:
-        """Phase hors-lock : edit du message, VC move, role grant,
-        confirmation ephemeral, declenchement formation si full.
+        """Lock-free phase: message edit, VC move, role grant,
+        ephemeral confirmation, formation trigger if full.
 
-        Toutes les ops Discord tournent en parallele (gather avec
-        return_exceptions=True). Une erreur Discord sur l'une n'impacte
-        pas les autres.
+        All Discord ops run in parallel (gather with
+        return_exceptions=True). A Discord error on one does not
+        impact the others.
         """
         embed = build_queue_embed(queue_doc, inter.guild, self.queue_type)
         edit_task = inter.edit_original_response(embed=embed, view=self)
         results = await asyncio.gather(
             _move_to_waiting_room(inter.user, self.queue_type),
-            _grant_queue_role(inter.user),
             edit_task,
             return_exceptions=True,
         )
         move_notice = results[0] if not isinstance(results[0], BaseException) else None
-        role_notice = results[1] if not isinstance(results[1], BaseException) else None
-        if isinstance(results[2], BaseException):
+        if isinstance(results[1], BaseException):
             logger.warning(
-                "[queue_v2] edit_original_response a echoue: %r",
-                results[2],
+                "[queue_v2] edit_original_response failed: %r",
+                results[1],
             )
 
         count = len(queue_doc.get("players", []))
         label = QUEUE_LABELS[self.queue_type]
-        confirm = f"✅ Tu as rejoint la queue **{label}** ({count}/{QUEUE_SIZE})"
+        confirm = f"✅ Tu as rejoint la file **{label}** ({count}/{QUEUE_SIZE})"
         if move_notice:
             confirm += f"\n{move_notice}"
-        if role_notice:
-            confirm += f"\n{role_notice}"
         await inter.followup.send(confirm, ephemeral=True)
 
         if full and self._on_full:
@@ -434,17 +406,17 @@ class QueueView(discord.ui.View):
         inter: discord.Interaction,
         queue_doc: dict,
     ) -> None:
-        """Invoque `_on_full` en garantissant la liberation de la queue
-        en cas d'exception non capturee, sinon la queue reste en status
-        'forming' et bloque toute nouvelle entree."""
+        """Invoke `_on_full` ensuring the queue is released on uncaught
+        exception, otherwise the queue stays in 'forming' status and
+        blocks any new entries."""
         try:
             await self._on_full(inter, queue_doc, self.queue_type)
         except Exception:
-            # On NE PROPAGE PAS le repr de l'exception aux utilisateurs :
-            # certaines exceptions pymongo/Discord leakent noms de
-            # collections, hosts, ou tokens partiels (CWE-209). Stack
-            # complete dans les logs admin.
-            logger.exception("[queue_v2] _safe_on_full a leve")
+            # We do NOT propagate the exception repr to users:
+            # some pymongo/Discord exceptions leak collection names,
+            # hosts, or partial tokens (CWE-209). Full stack in admin
+            # logs.
+            logger.exception("[queue_v2] _safe_on_full raised")
             try:
                 repository.delete_active_queue(
                     self.db,
@@ -452,11 +424,11 @@ class QueueView(discord.ui.View):
                     self.queue_type,
                 )
             except Exception:
-                logger.exception("[queue_v2] cleanup apres on_full a leve")
+                logger.exception("[queue_v2] cleanup after on_full raised")
             user_msg = (
                 "❌ Erreur interne lors de la formation du match. "
-                f"La queue {self.queue_type.upper()} a ete liberee, "
-                "retentez avec /setup-queue."
+                f"La file {self.queue_type.upper()} a été libérée, "
+                "réessaie avec /setup-queue."
             )
             channel = inter.channel
             try:
@@ -473,11 +445,11 @@ class QueueView(discord.ui.View):
                             await inter.user.send(user_msg)
                         except discord.Forbidden:
                             logger.warning(
-                                "[queue_v2] DM fallback bloque (Forbidden) pour user %s",
+                                "[queue_v2] DM fallback blocked (Forbidden) for user %s",
                                 inter.user.id,
                             )
             except Exception:
-                logger.exception("[queue_v2] notification erreur a leve")
+                logger.exception("[queue_v2] error notification raised")
 
     async def _leave_callback(self, inter: discord.Interaction):
         try:
@@ -500,8 +472,8 @@ class QueueView(discord.ui.View):
                 )
                 return
             queue_doc = res.queue
-            # Lecture cross-queues pendant qu'on tient encore le lock pour
-            # garantir la coherence : "le joueur est-il encore quelque part ?"
+            # Cross-queue read while we still hold the lock to guarantee
+            # consistency: "is the player still somewhere ?"
             still_in = None
             if isinstance(inter.user, discord.Member):
                 still_in = await asyncio.to_thread(
@@ -511,7 +483,7 @@ class QueueView(discord.ui.View):
                     inter.user.id,
                 )
 
-        # Lock libere : side-effects Discord en parallele.
+        # Lock released: Discord side-effects in parallel.
         embed = build_queue_embed(queue_doc, inter.guild, self.queue_type)
         tasks: list = [inter.edit_original_response(embed=embed, view=self)]
         if isinstance(inter.user, discord.Member) and still_in is None:
@@ -519,31 +491,30 @@ class QueueView(discord.ui.View):
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, BaseException):
-                logger.warning("[queue_v2] leave side-effect a echoue: %r", r)
+                logger.warning("[queue_v2] leave side-effect failed: %r", r)
 
 
 def _join_error_message(reason: str) -> str:
     return {
-        "no_queue": "❌ Aucune queue active sur ce serveur.",
-        "queue_closed": "❌ La queue est fermee (match en cours de formation).",
-        "already_in": "❌ Tu es deja dans la queue.",
-        "queue_full": "❌ La queue est pleine (10/10).",
-        "race": "⚠️ Conflit, reessaie.",
+        "no_queue": "❌ Aucune file active sur ce serveur.",
+        "queue_closed": "❌ La file est fermée (match en cours de formation).",
+        "already_in": "❌ Tu es déjà dans la file.",
+        "queue_full": "❌ La file est pleine (10/10).",
+        "race": "⚠️ Conflit, réessaie.",
     }.get(reason, f"❌ Erreur : {reason}")
 
 
 def _leave_error_message(reason: str) -> str:
     return {
-        "no_queue": "❌ Aucune queue active.",
-        "not_in": "❌ Tu n'es pas dans la queue.",
+        "no_queue": "❌ Aucune file active.",
+        "not_in": "❌ Tu n'es pas dans la file.",
     }.get(reason, f"❌ Erreur : {reason}")
 
 
 # ── Cog ───────────────────────────────────────────────────────────
 _QUEUE_CHOICES = [
-    app_commands.Choice(name="Pro", value="pro"),
     app_commands.Choice(name="Open", value="open"),
-    app_commands.Choice(name="GC", value="gc"),
+    app_commands.Choice(name="Advanced", value="advanced"),
 ]
 
 
@@ -552,19 +523,19 @@ class QueueCog(commands.Cog):
         self.bot = bot
         self.db = db
         self.on_full = on_full
-        # 1 view par queue_type, custom_ids distincts. Toutes branchees
-        # sur le meme on_full callback (le cog match dispatchera selon
-        # le queue_type passe a _safe_on_full).
+        # 1 view per queue_type, distinct custom_ids. All wired to the
+        # same on_full callback (the match cog will dispatch by the
+        # queue_type passed to _safe_on_full).
         self.views: dict[str, QueueView] = {
             qt: QueueView(db, queue_type=qt, on_full=on_full) for qt in repository.QUEUE_TYPES
         }
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
-        """Quand un joueur quitte le serveur (kick, ban, leave), le retirer
-        des queues actives (toutes, on ne sait pas dans laquelle il etait).
-        Sans ce handler, sa place reste reservee et la queue se bloque a
-        9/10 jusqu'a ce qu'un admin force un reset."""
+        """When a player leaves the server (kick, ban, leave), remove them
+        from active queues (all of them, we do not know which one they were in).
+        Without this handler, their slot stays reserved and the queue gets
+        stuck at 9/10 until an admin force-resets it."""
         for qt in repository.QUEUE_TYPES:
             try:
                 await asyncio.to_thread(
@@ -575,13 +546,13 @@ class QueueCog(commands.Cog):
                     member.id,
                 )
             except Exception:
-                logger.exception("[queue_v2] on_member_remove a leve (qt=%s)", qt)
+                logger.exception("[queue_v2] on_member_remove raised (qt=%s)", qt)
 
     @app_commands.command(
         name="setup-queue",
-        description="Pose le message de queue dans ce salon",
+        description="Poste le message de file dans ce salon",
     )
-    @app_commands.describe(queue="Type de queue : Pro, Open ou GC")
+    @app_commands.describe(queue="Type de file : Open ou Advanced")
     @app_commands.choices(queue=_QUEUE_CHOICES)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def setup_queue(
@@ -592,18 +563,18 @@ class QueueCog(commands.Cog):
         expected_channel = QUEUE_CHANNEL_NAMES[queue]
         if getattr(interaction.channel, "name", None) != expected_channel:
             await interaction.response.send_message(
-                f"🚫 La queue **{queue.upper()}** doit etre configuree dans #{expected_channel}.",
+                f"🚫 La file **{queue.upper()}** doit être configurée dans #{expected_channel}.",
                 ephemeral=True,
             )
             return
 
-        # Reset de la queue precedente du meme type s'il y en avait une
+        # Reset of the previous queue of the same type if there was one
         repository.delete_active_queue(self.db, interaction.guild_id, queue)
 
         await self.post_queue_message(interaction.channel, queue)
 
         await interaction.response.send_message(
-            f"✅ Queue **{queue.upper()}** active dans {interaction.channel.mention} !",
+            f"✅ File **{queue.upper()}** active dans {interaction.channel.mention} !",
             ephemeral=True,
         )
 
@@ -612,11 +583,10 @@ class QueueCog(commands.Cog):
         channel: discord.TextChannel,
         queue_type: str,
     ) -> None:
-        """Pose un nouveau message de queue dans `channel` et l'enregistre.
+        """Post a new queue message in `channel` and register it.
 
-        Utilise par /setup-queue ET par le cog match apres formation
-        d'un match (pour qu'une nouvelle queue soit immediatement
-        disponible apres formation)."""
+        Used by /setup-queue AND by the match cog after match formation
+        (so a new queue is immediately available after formation)."""
         view = self.views[queue_type]
         embed = build_queue_embed(None, channel.guild, queue_type)
         msg = await channel.send(embed=embed, view=view)
@@ -630,9 +600,9 @@ class QueueCog(commands.Cog):
 
     @app_commands.command(
         name="close-queue",
-        description="Ferme la queue active d'un type",
+        description="Ferme la file active d'un type",
     )
-    @app_commands.describe(queue="Type de queue : Pro, Open ou GC")
+    @app_commands.describe(queue="Type de file : Open ou Advanced")
     @app_commands.choices(queue=_QUEUE_CHOICES)
     @app_commands.checks.has_permissions(manage_guild=True)
     async def close_queue(
@@ -640,9 +610,9 @@ class QueueCog(commands.Cog):
         interaction: discord.Interaction,
         queue: str,
     ) -> None:
-        # Recupere la queue active pour pouvoir supprimer le message
-        # persistant Rejoindre/Quitter dans Discord avant la purge DB,
-        # et capturer la liste des joueurs avant de purger.
+        # Fetch the active queue to be able to delete the persistent
+        # Join/Leave message in Discord before the DB purge, and to
+        # capture the list of players before purging.
         queue_doc = repository.get_active_queue(
             self.db,
             interaction.guild_id,
@@ -673,11 +643,11 @@ class QueueCog(commands.Cog):
             queue,
         )
 
-        # Apres la purge DB, retirer le role "En Queue" a chaque joueur
-        # qui n'est plus dans aucune autre queue active. Le check
-        # `find_player_in_any_queue` garantit qu'on ne strip pas le role
-        # a un joueur encore present dans une autre queue (un joueur ne
-        # peut techniquement etre que dans une seule, mais on reste safe).
+        # After the DB purge, remove the "In Queue" role from each player
+        # who is no longer in any other active queue. The
+        # `find_player_in_any_queue` check ensures we do not strip the
+        # role from a player still present in another queue (a player
+        # technically can only be in one, but stay safe).
         if player_ids:
             guild = interaction.guild
             role_tasks: list = []
@@ -698,14 +668,14 @@ class QueueCog(commands.Cog):
                 for r in results:
                     if isinstance(r, BaseException):
                         logger.warning(
-                            "[queue_v2] close-queue revoke role a echoue: %r",
+                            "[queue_v2] close-queue revoke role failed: %r",
                             r,
                         )
 
         msg = (
-            f"✅ Queue {queue.upper()} supprimee."
+            f"✅ File {queue.upper()} supprimée."
             if deleted
-            else f"ℹ️ Aucune queue {queue.upper()} active."
+            else f"ℹ️ Aucune file {queue.upper()} active."
         )
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -714,7 +684,7 @@ class QueueCog(commands.Cog):
     async def _perm_error(self, inter: discord.Interaction, error):
         if isinstance(error, app_commands.MissingPermissions):
             await inter.response.send_message(
-                "🚫 Reserve aux administrateurs.",
+                "🚫 Réservé aux administrateurs.",
                 ephemeral=True,
             )
 
@@ -722,6 +692,6 @@ class QueueCog(commands.Cog):
 async def setup(bot: commands.Bot, db, on_full=None) -> None:
     cog = QueueCog(bot, db, on_full=on_full)
     await bot.add_cog(cog)
-    # Enregistre les 3 views pour qu'elles persistent apres restart.
+    # Register the views so they persist after restart.
     for view in cog.views.values():
         bot.add_view(view)

@@ -1,19 +1,17 @@
 """
-Helper pour rafraichir automatiquement le leaderboard apres une modification
-d'ELO. Supprime le dernier message leaderboard du bot dans le salon
-`#leaderboard` puis poste une nouvelle image generee a partir des donnees
-courantes de la base.
+Helper to automatically refresh the leaderboard after an ELO change.
+Deletes the bot's last leaderboard message in the `#leaderboard` channel
+then posts a new image generated from the current data in the database.
 
-Utilise par :
-  - cogs/match.py (apres application de l'ELO post-match)
+Used by:
+  - cogs/match.py (after applying post-match ELO)
   - bot.py /elomodify, /resetelo (slash + prefix)
 """
 
 from __future__ import annotations
 
-import logging
-
 import asyncio
+import logging
 import re
 from collections import OrderedDict
 from datetime import UTC, datetime
@@ -23,6 +21,7 @@ import discord
 
 from leaderboard_img import generate_leaderboard
 from services import repository
+from services.inactivity import is_active
 
 logger = logging.getLogger(__name__)
 
@@ -32,28 +31,28 @@ LEADERBOARD_FILENAME = "leaderboard.png"
 PAGE_SIZE = 15
 
 
-# Debounce per-guild : evite de regenerer + reposter le leaderboard
-# en rafale apres N modifs ELO consecutives (ex: /win + /lose + autres
-# admin ops). Discord rate-limit le delete+send (~5/min/channel).
+# Per-guild debounce: avoid regenerating + reposting the leaderboard
+# in bursts after N consecutive ELO changes (e.g. /win + /lose + other
+# admin ops). Discord rate-limits delete+send (~5/min/channel).
 _REFRESH_DEBOUNCE_SECONDS: int = 30
-# Borne le cache pour eviter une fuite memoire si le bot tourne sur de
-# nombreuses guilds (entree par guild_id, jamais purgee). LRU avec
-# eviction FIFO du plus ancien acces au-dela de _MAX_GUILDS_TRACKED.
+# Bounds the cache to avoid a memory leak if the bot runs on many
+# guilds (one entry per guild_id, never purged). LRU with FIFO
+# eviction of the oldest access beyond _MAX_GUILDS_TRACKED.
 _MAX_GUILDS_TRACKED: int = 1024
 _LAST_REFRESH_AT: OrderedDict[tuple[int, str], datetime] = OrderedDict()
 
-# ── Cache des pages rendues ───────────────────────────────────────
-# Cache lazy : la page est rendue a la 1ere consultation et stockee
-# en bytes (pas en discord.File qui est single-use). A chaque cache
-# hit on enveloppe les bytes dans un nouveau BytesIO + File.
+# -- Rendered page cache -------------------------------------------
+# Lazy cache: the page is rendered on first lookup and stored as
+# bytes (not as discord.File which is single-use). On every cache
+# hit we wrap the bytes in a new BytesIO + File.
 #
-# Invalidation : `refresh_leaderboard_channel` clear toutes les
-# entrees (guild_id, queue_type, *) avant de regenerer la page 1.
-# Toute mutation d'ELO passe par cette fonction -> coherence garantie
-# tant que ce contrat est respecte.
+# Invalidation: `refresh_leaderboard_channel` clears all entries
+# (guild_id, queue_type, *) before regenerating page 1. Every ELO
+# mutation goes through this function -> consistency guaranteed
+# as long as this contract is respected.
 #
-# Cle  : (guild_id, queue_type, page_zero_indexed)
-# Val  : (png_bytes, total_pages_at_render_time)
+# Key : (guild_id, queue_type, page_zero_indexed)
+# Val : (png_bytes, total_pages_at_render_time)
 _PAGE_CACHE_MAXSIZE: int = 60  # ~3 queues * 20 pages
 _PAGE_CACHE: OrderedDict[tuple[int, str, int], tuple[bytes, int]] = OrderedDict()
 
@@ -81,11 +80,11 @@ def _cache_set(
 
 
 def _cache_invalidate(guild_id: int, queue_type: str) -> int:
-    """Supprime toutes les entrees du cache pour ce (guild, queue_type).
+    """Delete all cache entries for this (guild, queue_type).
 
-    Appele depuis `refresh_leaderboard_channel` quand on vient d'apprendre
-    qu'un ELO a change. Retourne le nombre d'entrees supprimees (utile
-    pour le debug et les tests)."""
+    Called from `refresh_leaderboard_channel` when we just learned that
+    an ELO has changed. Returns the number of entries deleted (useful
+    for debugging and tests)."""
     to_remove = [k for k in _PAGE_CACHE if k[0] == guild_id and k[1] == queue_type]
     for k in to_remove:
         del _PAGE_CACHE[k]
@@ -93,8 +92,8 @@ def _cache_invalidate(guild_id: int, queue_type: str) -> int:
 
 
 def _clear_page_cache_for_tests() -> None:
-    """Vide entierement le cache. Utilise uniquement par les tests pour
-    isoler les cas (le cache est process-wide, donc partage entre tests)."""
+    """Fully clear the cache. Used only by tests to isolate cases
+    (the cache is process-wide, hence shared across tests)."""
     _PAGE_CACHE.clear()
 
 
@@ -103,20 +102,19 @@ _ATTACH_FILENAME_RE = re.compile(r"^leaderboard_([a-z0-9_\-]+)\.png$", re.IGNORE
 
 
 class LeaderboardView(discord.ui.View):
-    """Vue paginee persistante pour le leaderboard.
+    """Persistent paginated view for the leaderboard.
 
-    Persistante = survit aux restarts du bot. Pour que les boutons
-    fonctionnent apres un redemarrage, la vue doit (1) avoir des
-    `custom_id` stables et (2) etre enregistree dans `on_ready` via
-    `bot.add_view(LeaderboardView())`.
+    Persistent = survives bot restarts. For the buttons to work after
+    a restart, the view must (1) have stable `custom_id`s and (2) be
+    registered in `on_ready` via `bot.add_view(LeaderboardView())`.
 
-    L'etat par-message (queue_type, page courante) n'est PAS stocke
-    cote bot : il est recupere depuis le message lui-meme :
-      - `queue_type` -> attachement nomme `leaderboard_{qt}.png`
-      - page courante -> label du bouton central `Page N / M`
+    The per-message state (queue_type, current page) is NOT stored
+    on the bot side: it is recovered from the message itself:
+      - `queue_type` -> attachment named `leaderboard_{qt}.png`
+      - current page -> label of the central button `Page N / M`
 
-    A chaque clic, on relit la BDD pour afficher des donnees fraiches
-    (le leaderboard peut avoir bouge depuis le dernier rendu).
+    On each click, we re-read the DB to display fresh data (the
+    leaderboard may have moved since the last render).
     """
 
     def __init__(
@@ -133,7 +131,7 @@ class LeaderboardView(discord.ui.View):
         self._sync_buttons()
 
     def _sync_buttons(self) -> None:
-        # Ordre des children = ordre des decorateurs @discord.ui.button :
+        # Order of children = order of @discord.ui.button decorators:
         # 0=prev_btn, 1=page_btn, 2=next_btn.
         self.prev_btn.disabled = self.page == 0
         self.next_btn.disabled = self.page >= self.total_pages - 1
@@ -141,10 +139,10 @@ class LeaderboardView(discord.ui.View):
 
     @staticmethod
     def _recover_state(message) -> tuple[str | None, int, int]:
-        """Reconstitue (queue_type, page_zero_indexee, total_pages) depuis un message.
+        """Recover (queue_type, page_zero_indexed, total_pages) from a message.
 
-        Robuste aux mocks et messages incomplets : retourne (None, 0, 1) si
-        rien d'exploitable n'est trouve.
+        Robust to mocks and incomplete messages: returns (None, 0, 1) if
+        nothing usable is found.
         """
         qt: str | None = None
         attachments = getattr(message, "attachments", None)
@@ -175,13 +173,13 @@ class LeaderboardView(discord.ui.View):
         return qt, page0, total
 
     async def _go(self, inter, new_page: int) -> None:
-        """Navigue vers `new_page` (index 0-base, absolu)."""
+        """Navigate to `new_page` (zero-based index, absolute)."""
         try:
             queue_type = self.queue_type
             total = self.total_pages
 
-            # Dispatch persistant : l'instance enregistree au niveau bot n'a
-            # pas d'etat par-message, on reconstruit depuis le message.
+            # Persistent dispatch: the instance registered at the bot level
+            # has no per-message state, so we rebuild from the message.
             recovered_from_message = False
             if queue_type is None:
                 msg = getattr(inter, "message", None)
@@ -204,8 +202,8 @@ class LeaderboardView(discord.ui.View):
             if not inter.response.is_done():
                 await inter.response.defer()
 
-            # Import tardif : evite la dependance circulaire bot <-> services
-            # au moment du chargement des modules.
+            # Late import: avoids the circular dependency bot <-> services
+            # at module-loading time.
             from bot import db as _db
 
             file, new_view = await build_leaderboard_payload(
@@ -217,10 +215,10 @@ class LeaderboardView(discord.ui.View):
             if file is None:
                 return
 
-            # Ne muter `self` que si on est sur l'instance par-message
-            # (queue_type initial non-None). Sur l'instance globale
-            # enregistree, muter polluerait les dispatches suivants entre
-            # guilds / queue_types differents.
+            # Only mutate `self` if we are on the per-message instance
+            # (initial queue_type non-None). On the globally registered
+            # instance, mutating would pollute subsequent dispatches
+            # across different guilds / queue_types.
             if not recovered_from_message:
                 self.page = new_page
                 if new_view is not None:
@@ -245,8 +243,9 @@ class LeaderboardView(discord.ui.View):
         msg = getattr(inter, "message", None)
         if msg is not None:
             _, m_page, _ = self._recover_state(msg)
-            # Si le message porte un label "Page N / M" exploitable, il fait
-            # autorite sur self.page (qui est 0 sur l'instance enregistree).
+            # If the message carries a usable "Page N / M" label, it is
+            # authoritative over self.page (which is 0 on the registered
+            # instance).
             if m_page > 0 or self.queue_type is None:
                 cur = m_page
         await self._go(inter, cur - 1)
@@ -276,31 +275,37 @@ class LeaderboardView(discord.ui.View):
         await self._go(inter, cur + 1)
 
 
+# Queue display labels used in leaderboard titles.
+QUEUE_DISPLAY_LABELS: dict[str, str] = {
+    "open": "Open Queue",
+    "advanced": "Advanced Queue",
+}
+
+
 async def build_leaderboard_payload(
     guild: discord.Guild,
     db,
     queue_type: str,
     *,
     with_view: bool = True,
-    view_timeout: float
-    | None = None,  # conserve pour back-compat, ignore (vue toujours persistante)
+    view_timeout: float | None = None,  # kept for back-compat, ignored (view is always persistent)
     page: int = 0,
 ) -> tuple[discord.File | None, discord.ui.View | None]:
-    """Genere file/view pour le leaderboard du queue_type donne, page `page`.
+    """Generate file/view for the leaderboard of the given queue_type, page `page`.
 
-    Utilise un cache lazy (cf. `_PAGE_CACHE`) pour eviter de re-rendre
-    une page deja generee. Le cache est invalide depuis
-    `refresh_leaderboard_channel` quand un changement d'ELO survient.
+    Uses a lazy cache (see `_PAGE_CACHE`) to avoid re-rendering an already
+    generated page. The cache is invalidated from
+    `refresh_leaderboard_channel` whenever an ELO change occurs.
     """
-    del view_timeout  # parametre conserve pour API stable, vue toujours timeout=None
+    del view_timeout  # parameter kept for stable API, view always timeout=None
     repository._check_queue_type(queue_type)
 
     filename = f"leaderboard_{queue_type}.png"
 
-    # Cache lookup AVANT Mongo : si la page demandee est en cache, on
-    # economise la query DB + le PIL render. La page renvoyee est l'image
-    # exacte rendue lors du dernier render (coherente avec le message
-    # actuellement poste dans #leaderboard).
+    # Cache lookup BEFORE Mongo: if the requested page is cached, we
+    # save the DB query + PIL render. The returned page is the exact
+    # image rendered on the last render (consistent with the message
+    # currently posted in #leaderboard).
     cached = _cache_get(guild.id, queue_type, page)
     if cached is not None:
         png_bytes, total_pages_cached = cached
@@ -321,9 +326,13 @@ async def build_leaderboard_payload(
     if not docs:
         return None, None
 
+    now = datetime.now(UTC)
     all_players = []
     rank = 1
     for doc in docs:
+        # Hide players inactive for more than 7 days (never-played too).
+        if not is_active(doc.get("last_played"), now):
+            continue
         uid = doc.get("user_id") or doc["_id"].split(":")[0]
         try:
             member = guild.get_member(int(uid))
@@ -356,16 +365,16 @@ async def build_leaderboard_payload(
     loop = asyncio.get_running_loop()
     start = page * PAGE_SIZE
     chunk = all_players[start : start + PAGE_SIZE]
-    # Le titre du leaderboard inclut le queue_type pour distinguer les
-    # 3 leaderboards qui cohabitent dans #leaderboard.
-    title = f"Leaderboard {queue_type.upper()} Queue"
+    # The leaderboard title includes the queue_type to distinguish the
+    # multiple leaderboards that coexist in #leaderboard.
+    title = f"Leaderboard {QUEUE_DISPLAY_LABELS.get(queue_type, queue_type.upper() + ' Queue')}"
     buf = await loop.run_in_executor(
         None,
         lambda: generate_leaderboard(chunk, server_name=f"{guild.name} - {title}"),
     )
 
-    # Stocker les bytes raw dans le cache (pas le discord.File qui est
-    # single-use). A chaque cache hit, on wrappera dans un BytesIO frais.
+    # Store the raw bytes in the cache (not the discord.File which is
+    # single-use). On each cache hit, we'll wrap them in a fresh BytesIO.
     png_bytes = buf.getvalue()
     _cache_set(guild.id, queue_type, page, png_bytes, total_pages)
 
@@ -384,7 +393,7 @@ async def build_leaderboard_payload(
 
 
 def _find_leaderboard_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    """Trouve le canal `#leaderboard`."""
+    """Find the `#leaderboard` channel."""
     needle = LEADERBOARD_CHANNEL_NAME.lower()
     for c in guild.text_channels:
         cname = (c.name or "").lower()
@@ -398,9 +407,9 @@ async def refresh_leaderboard_channel(
     db,
     queue_type: str,
 ) -> None:
-    """Refresh le leaderboard du queue_type donne dans `#leaderboard`.
+    """Refresh the leaderboard of the given queue_type in `#leaderboard`.
 
-    Per-queue debounce : une rafale Pro ne bloque pas un refresh Open."""
+    Per-queue debounce: an Advanced burst does not block an Open refresh."""
     repository._check_queue_type(queue_type)
     now = datetime.now(UTC)
     key = (guild.id, queue_type)
@@ -413,12 +422,12 @@ async def refresh_leaderboard_channel(
     while len(_LAST_REFRESH_AT) > _MAX_GUILDS_TRACKED:
         _LAST_REFRESH_AT.popitem(last=False)
 
-    # ELO a change pour ce (guild, queue_type) ET on va effectivement
-    # rendre une nouvelle page (debounce passe) -> invalide les pages
-    # caches pour eviter de servir des donnees perimees. La page 1
-    # fraichement rendue ci-dessous repeuplera le cache via _cache_set.
-    # Note : si le debounce avait renvoye plus haut, on n'invalide PAS
-    # - le message poste reste l'ancien, donc le cache reste coherent.
+    # ELO has changed for this (guild, queue_type) AND we are about to
+    # render a new page (debounce passed) -> invalidate cached pages
+    # to avoid serving stale data. Page 1 freshly rendered below will
+    # repopulate the cache via _cache_set.
+    # Note: if the debounce had returned earlier, we do NOT invalidate
+    # - the posted message stays the old one, so the cache stays consistent.
     _cache_invalidate(guild.id, queue_type)
 
     chan = _find_leaderboard_channel(guild)
@@ -435,9 +444,9 @@ async def refresh_leaderboard_channel(
         except Exception:
             logger.exception("leaderboard_refresh exception")
 
-    # NO fallback history scan : avec plusieurs LBs qui cohabitent, on
-    # ne peut pas identifier "lequel" sans le state persiste. Si aucun
-    # stored_id n'existe, on poste juste le nouveau message.
+    # NO fallback history scan: with multiple LBs coexisting, we
+    # cannot identify "which one" without the persisted state. If no
+    # stored_id exists, we just post the new message.
 
     try:
         file, view = await build_leaderboard_payload(

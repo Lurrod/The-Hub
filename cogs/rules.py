@@ -1,10 +1,11 @@
-"""Cog reglement : commande /rules + bouton d'acceptation persistant.
+"""Cog Règlement : commande /rules + bouton d'acceptation persistant.
 
-Pose un message permanent affichant le reglement avec un bouton « J'accepte ».
-Les joueurs doivent accepter pour rejoindre la Pro Queue (gate dans
-cogs/queue_v2.py). L'acceptation est stockee globalement par joueur dans la
-collection `rules` (cf. services/repository.py). Le bouton a un custom_id fixe
-pour survivre aux redemarrages, enregistre via bot.add_view dans setup().
+Poste un message permanent affichant le règlement avec un bouton
+« J'accepte ». Les joueurs doivent accepter pour rejoindre la file
+Advanced (vérifié dans cogs/queue_v2.py). L'acceptation est stockée
+globalement par joueur dans la collection `rules`
+(cf. services/repository.py). Le bouton a un custom_id fixe pour
+survivre aux redémarrages, enregistré via bot.add_view dans setup().
 """
 
 from __future__ import annotations
@@ -24,19 +25,19 @@ logger = logging.getLogger(__name__)
 RULES_TITLE = "📜 Règlement"
 
 RULES_LINES: tuple[str, ...] = (
-    "Pas de type in game",
-    "Pas d'insulte en vocal / à l'écrit sur le Discord et in game",
-    "Tbag autorisé dans la mesure du raisonnable",
-    "Pas de troll in game, on est là pour jouer sérieusement",
+    "Pas de typing en jeu",
+    "Pas d'insultes en vocal / texte sur Discord et en jeu",
+    "Le tbag est autorisé avec modération",
+    "Pas de troll en jeu, on est là pour jouer sérieusement",
 )
 
 RULES_RECLAMATIONS = (
-    "Pour toutes plaintes / réclamations vous pouvez ouvrir un ticket dans #tickets-reports"
+    "Pour toute réclamation / plainte, tu peux ouvrir un ticket dans #tickets-reports"
 )
 
 
 def build_rules_embed() -> discord.Embed:
-    """Construit l'embed du reglement (lignes + bloc reclamations)."""
+    """Construit l'embed du règlement (lignes + bloc réclamations)."""
     description = "\n".join(f"• {line}" for line in RULES_LINES)
     embed = discord.Embed(
         title=RULES_TITLE,
@@ -44,15 +45,15 @@ def build_rules_embed() -> discord.Embed:
         color=0x5865F2,
     )
     embed.add_field(name="Réclamations", value=RULES_RECLAMATIONS, inline=False)
-    embed.set_footer(text="Clique sur « J'accepte » pour pouvoir rejoindre la Pro Queue.")
+    embed.set_footer(text="Clique sur « J'accepte » pour pouvoir rejoindre la file Advanced.")
     return embed
 
 
 class RulesView(discord.ui.View):
-    """View persistante : un bouton « J'accepte » qui enregistre l'acceptation.
+    """Vue persistante : un bouton « J'accepte » qui enregistre l'acceptation.
 
-    Le bouton est cree manuellement avec un custom_id fixe (`rules:accept`)
-    pour survivre aux redemarrages, comme QueueView."""
+    Le bouton est créé manuellement avec un custom_id fixe (`rules:accept`)
+    pour survivre aux redémarrages, comme QueueView."""
 
     def __init__(self, db) -> None:
         super().__init__(timeout=None)
@@ -75,14 +76,14 @@ class RulesView(discord.ui.View):
                 display_name=getattr(inter.user, "display_name", str(inter.user.id)),
             )
         except Exception:
-            logger.exception("[rules] echec enregistrement acceptation")
+            logger.exception("[rules] failed to save acceptance")
             await inter.response.send_message(
                 "❌ Une erreur est survenue, réessaie dans un instant.",
                 ephemeral=True,
             )
             return
         await inter.response.send_message(
-            "✅ Règlement accepté, tu peux rejoindre la Pro Queue.",
+            "✅ Règlement accepté, tu peux rejoindre la file Advanced.",
             ephemeral=True,
         )
 
@@ -95,13 +96,13 @@ class RulesCog(commands.Cog):
 
     @app_commands.command(
         name="rules",
-        description="Poste le reglement avec un bouton d'acceptation dans ce salon",
+        description="Poste le règlement avec un bouton d'acceptation dans ce salon",
     )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def rules(self, interaction: discord.Interaction) -> None:
         if interaction.channel is None:
             await interaction.response.send_message(
-                "❌ Salon introuvable, relance la commande dans un salon texte.",
+                "❌ Salon introuvable, lance la commande dans un salon textuel.",
                 ephemeral=True,
             )
             return
@@ -112,7 +113,7 @@ class RulesCog(commands.Cog):
         )
 
     async def post_rules_message(self, channel: discord.abc.Messageable) -> None:
-        """Pose le message permanent (embed + RulesView) dans `channel`."""
+        """Poste le message permanent (embed + RulesView) dans `channel`."""
         await channel.send(embed=build_rules_embed(), view=self.rules_view)
 
     @rules.error
@@ -129,5 +130,5 @@ class RulesCog(commands.Cog):
 async def setup(bot: commands.Bot, db) -> None:
     cog = RulesCog(bot, db)
     await bot.add_cog(cog)
-    # Enregistre la view pour qu'elle persiste apres restart.
+    # Register the view so it persists after restart.
     bot.add_view(cog.rules_view)

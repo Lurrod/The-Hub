@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 from datetime import UTC
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -15,19 +16,37 @@ from services.leaderboard_refresh import (
 )
 from services.riot_api import HenrikDevClient
 
-# Configuration logging globale : sans ce basicConfig, le root logger
-# reste a WARNING par defaut et le format minimaliste de Python est
-# utilise (pas de timestamp, pas de niveau, pas de nom de module).
-# En prod sur PM2, les logs `logger.info(...)` etaient silencieusement
-# perdus. Niveau pilote par la variable d'env LOG_LEVEL (defaut INFO).
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-
 logger = logging.getLogger(__name__)
 
-# ── Charge .env si present (sans planter si python-dotenv absent) ──
+
+def _configure_logging() -> None:
+    """Configure root logging. Idempotent — clears prior handlers.
+
+    Split stdout / stderr: DEBUG+INFO -> stdout, WARNING+ -> stderr.
+    PM2 captures stdout -> out.log and stderr -> error.log, so as long
+    as nothing is abnormal only out.log fills up.
+
+    Without this, the root logger stays at WARNING by default with
+    Python's minimal format (no timestamp/level/module). In prod on PM2,
+    `logger.info(...)` logs would be silently lost.
+    """
+    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.addFilter(lambda r: r.levelno < logging.WARNING)
+    stdout_handler.setFormatter(fmt)
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(fmt)
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, log_level, logging.INFO))
+    root.handlers.clear()
+    root.addHandler(stdout_handler)
+    root.addHandler(stderr_handler)
+
+
+# ── Load .env if present (without crashing if python-dotenv missing) ──
 try:
     from dotenv import load_dotenv
 
@@ -39,29 +58,29 @@ except ImportError:
 TOKEN = os.environ.get("DISCORD_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
 
-# Fail-fast au demarrage si MONGO_URL est absent ou vide. Sans cette
-# garde, MongoClient(None, ...) tombe silencieusement sur le defaut
-# pymongo `mongodb://localhost:27017/` -- en prod sur Kimsufi ca peut
-# faire pointer le bot vers une instance Mongo absente, avec une erreur
-# `serverSelectionTimeoutMS` 5 s plus tard et aucun message clair sur
-# la cause (env var manquante apres un `pm2 restart` sans --update-env).
+# Fail-fast at startup if MONGO_URL is missing or empty. Without this
+# guard, MongoClient(None, ...) silently falls back to pymongo's
+# default `mongodb://localhost:27017/` -- in prod on Kimsufi this can
+# point the bot to a missing Mongo instance, with a
+# `serverSelectionTimeoutMS` error 5s later and no clear message about
+# the cause (missing env var after a `pm2 restart` without --update-env).
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL environment variable not set")
 
 ELO_START = elo_calc.ELO_START
 MAPS = list(elo_calc.MAPS)
 
-# Pondération ELO par position de joueur (slot 1..5) pour /win et /lose.
-# Le premier slot encaisse le plus gros gain / la plus petite perte.
+# ELO weighting by player position (slot 1..5) for /win and /lose.
+# The first slot takes the biggest gain / smallest loss.
 WIN_DELTAS_BY_SLOT: tuple[int, ...] = (20, 18, 17, 16, 15)
 LOSE_DELTAS_BY_SLOT: tuple[int, ...] = (10, 10, 12, 13, 15)
 
 # ── MongoDB ────────────────────────────────────────────────────
-# retryWrites/retryReads sont True par defaut depuis pymongo 4.x mais on les
-# explicite pour resilience aux blips reseau. serverSelectionTimeoutMS=5000
-# evite de bloquer >30s sur Mongo down -> Discord renvoie "L'application n'a
-# pas repondu". connectTimeoutMS=5000 limite le handshake initial.
-client: MongoClient = MongoClient(
+# retryWrites/retryReads are True by default since pymongo 4.x but we
+# make them explicit for network-blip resilience. serverSelectionTimeoutMS=5000
+# avoids blocking >30s when Mongo is down -> Discord returns "The application
+# did not respond". connectTimeoutMS=5000 caps the initial handshake.
+client: "MongoClient[dict[str, Any]]" = MongoClient(
     MONGO_URL,
     tz_aware=True,
     tzinfo=UTC,
@@ -91,11 +110,10 @@ def get_player(col, member: discord.Member, queue_type: str):
     )
 
 
-# Choix slash commun a toutes les commandes ELO/leaderboard.
+# Slash choices shared by all ELO/leaderboard commands.
 _QUEUE_CHOICES = [
-    app_commands.Choice(name="Pro", value="pro"),
     app_commands.Choice(name="Open", value="open"),
-    app_commands.Choice(name="GC", value="gc"),
+    app_commands.Choice(name="Advanced", value="advanced"),
 ]
 
 
@@ -123,7 +141,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 
-# ── Chargement des cogs V2 ────────────────────────────────────────
+# ── V2 cogs loading ───────────────────────────────────────────────
 riot_client = HenrikDevClient()
 
 
@@ -137,6 +155,7 @@ async def _load_v2_cogs() -> None:
     from cogs.queue_v2 import setup as setup_queue_v2
     from cogs.riot_link import setup as setup_riot_link
     from cogs.rules import setup as setup_rules
+    from cogs.stats import setup as setup_stats
 
     await setup_riot_link(bot, db, riot_client)
     match_cog = await setup_match(bot, db, henrik_client=riot_client)
@@ -144,6 +163,7 @@ async def _load_v2_cogs() -> None:
     await setup_applications(bot, db)
     await setup_admin(bot, db)
     await setup_elo_admin(bot, db)
+    await setup_stats(bot, db)
     await setup_moderation(bot, db)
     await setup_prefix_legacy(bot, db)
     await setup_rules(bot, db)
@@ -151,16 +171,16 @@ async def _load_v2_cogs() -> None:
 
 @bot.event
 async def setup_hook():
-    # Charger les cogs essentiels (queue_v2, match, riot_link). Sans eux,
-    # le bot demarre en mode degrade (slash commands manquantes, queue
-    # inaccessible) sans signaler clairement l'erreur. On log + on
-    # raise pour fail fast plutot que de laisser tourner un bot inutile.
+    # Load essential cogs (queue_v2, match, riot_link). Without them,
+    # the bot starts in degraded mode (missing slash commands, queue
+    # inaccessible) without clearly reporting the error. We log + raise
+    # to fail fast rather than running a useless bot.
     try:
         await _load_v2_cogs()
     except Exception:
-        # Re-raise : Discord.py va arreter le startup. Mieux qu'un bot
-        # silencieusement cassé en prod.
-        logger.critical("[setup_hook] CRITIQUE : echec chargement des cogs", exc_info=True)
+        # Re-raise: Discord.py will stop startup. Better than a bot
+        # silently broken in prod.
+        logger.critical("[setup_hook] CRITICAL: cog loading failed", exc_info=True)
         raise
 
 
@@ -172,64 +192,41 @@ async def on_ready():
     global _synced_once
 
     if _synced_once:
-        # on_ready peut etre fire plusieurs fois (reconnects WS) : on sync
-        # uniquement au premier ready pour eviter de spammer Discord et de
-        # subir le temps de propagation global (~1h) inutilement. Idem
-        # pour `add_view` qui referencerait des instances View neuves a
-        # chaque reconnect (leak memoire mineur sur reconnects frequents).
-        logger.info("Bot reconnecte : %s (sync slash skipped)", bot.user)
+        # on_ready can fire multiple times (WS reconnects): we sync only
+        # on the first ready to avoid spamming Discord and uselessly
+        # waiting for the global propagation time (~1h). Same for
+        # `add_view` which would reference new View instances on each
+        # reconnect (minor memory leak on frequent reconnects).
+        logger.info("Bot reconnected: %s (slash sync skipped)", bot.user)
         return
 
-    # Premier on_ready uniquement : enregistrement de la view leaderboard.
-    # Les autres vues persistantes (Welcome, ApplicationReview, CloseTicket,
-    # Report, Queue) sont enregistrees par leurs cogs respectifs lors du
-    # setup_hook (cf. cogs/applications.py et cogs/queue_v2.py).
-    # LeaderboardView : pagination des messages leaderboard persistants
-    # postes dans #leaderboard. Sans cet enregistrement, les boutons
-    # prev/next ne fonctionnent plus apres un restart du bot. Deux
-    # variantes : permanente (3 queues) et weekly (Pro Queue, canal
-    # #leaderboard-weekly, custom_ids differents).
+    # First on_ready only: registration of the leaderboard view.
+    # Other persistent views (Welcome, ApplicationReview, CloseTicket,
+    # Report, Queue) are registered by their respective cogs during
+    # setup_hook (cf. cogs/applications.py and cogs/queue_v2.py).
+    # LeaderboardView: pagination for the persistent leaderboard
+    # messages posted in #leaderboard. Without this registration, the
+    # prev/next buttons stop working after a bot restart.
     bot.add_view(LeaderboardView())
-    bot.add_view(LeaderboardView(weekly=True))
 
-    # Sync rapide sur une guild specifique si DEV_GUILD_ID est defini.
-    # Sinon, sync global (peut prendre jusqu'a 1h pour propager).
+    # Fast sync on a specific guild if DEV_GUILD_ID is defined.
+    # Otherwise, global sync (can take up to 1h to propagate).
     dev_guild_id = os.getenv("DEV_GUILD_ID")
     if dev_guild_id:
         guild = discord.Object(id=int(dev_guild_id))
         tree.copy_global_to(guild=guild)
         synced = await tree.sync(guild=guild)
-        logger.info("Bot connecte : %s (ID: %s)", bot.user, bot.user.id)
-        logger.info("%d commandes slash synchronisees sur guild %s.", len(synced), dev_guild_id)
+        logger.info("Bot connected: %s (ID: %s)", bot.user, bot.user.id)
+        logger.info("%d slash commands synced on guild %s.", len(synced), dev_guild_id)
     else:
         synced = await tree.sync()
-        logger.info("Bot connecte : %s (ID: %s)", bot.user, bot.user.id)
-        logger.info(
-            "%d commandes slash synchronisees (global, propagation jusqu'a 1h).", len(synced)
-        )
+        logger.info("Bot connected: %s (ID: %s)", bot.user, bot.user.id)
+        logger.info("%d slash commands synced (global, propagation up to 1h).", len(synced))
     _synced_once = True
 
 
 if __name__ == "__main__":
-    # Configuration logging : niveau INFO + format avec timestamp et logger
-    # name. Permet de filtrer en prod (ex: -e LOG_LEVEL=DEBUG via supervisor).
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    # Split stdout / stderr : DEBUG+INFO -> stdout, WARNING+ -> stderr.
-    # PM2 capture stdout -> out.log et stderr -> error.log, donc tant que
-    # rien n'est anormal seul out.log se remplit.
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.DEBUG)
-    stdout_handler.addFilter(lambda r: r.levelno < logging.WARNING)
-    stdout_handler.setFormatter(fmt)
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.WARNING)
-    stderr_handler.setFormatter(fmt)
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, log_level, logging.INFO))
-    root.handlers.clear()
-    root.addHandler(stdout_handler)
-    root.addHandler(stderr_handler)
+    _configure_logging()
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN environment variable not set")
     bot.run(TOKEN)

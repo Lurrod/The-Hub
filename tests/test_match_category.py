@@ -101,6 +101,7 @@ async def test_create_match_category_overwrites_deny_everyone_and_allow_players(
 
 @pytest.mark.asyncio
 async def test_create_match_category_rolls_back_on_partial_failure():
+    """Partial creation failure must trigger a full rollback."""
     from services.match_category import create_match_category
 
     category = MagicMock()
@@ -403,9 +404,10 @@ async def test_delete_match_category_category_not_found_is_silenced():
 @pytest.mark.asyncio
 async def test_cleanup_orphan_logs_on_delete_error_and_continues():
     """When delete_match_category logs an error, cleanup_orphan continues to next category."""
-    from services.match_category import cleanup_orphan_match_categories
-    import services.match_category as mc_module
     from unittest.mock import patch
+
+    import services.match_category as mc_module
+    from services.match_category import cleanup_orphan_match_categories
 
     orphan_a = MagicMock(spec=discord.CategoryChannel)
     orphan_a.id = 10
@@ -437,22 +439,22 @@ async def test_cleanup_orphan_logs_on_delete_error_and_continues():
 
 @pytest.mark.asyncio
 async def test_create_match_category_rollback_survives_cascade_delete_failures():
-    """Si la creation echoue ET que les delete de rollback echouent aussi,
-    on doit : (1) tenter chaque delete (pas de short-circuit), (2) re-lever
-    l'exception ORIGINALE de creation, pas celle du rollback, (3) ne pas
-    boucler indefiniment."""
+    """If creation fails AND the rollback deletes also fail, we must:
+    (1) attempt every delete (no short-circuit), (2) re-raise the
+    ORIGINAL creation exception, not the rollback one, (3) not loop
+    forever."""
     from services.match_category import create_match_category
 
     category = MagicMock()
-    # La suppression de la categorie elle-meme echoue aussi.
+    # The category delete itself also fails.
     category.delete = AsyncMock(side_effect=RuntimeError("category delete failed"))
 
     text_channel = MagicMock()
-    # Le premier delete enfant echoue : ne doit pas court-circuiter les suivants.
+    # The first child delete fails: must not short-circuit the rest.
     text_channel.delete = AsyncMock(side_effect=RuntimeError("child delete failed"))
 
     vc1 = MagicMock()
-    vc1.delete = AsyncMock()  # second delete reussit -> on verifie qu'il est tente
+    vc1.delete = AsyncMock()  # second delete succeeds -> we verify it is attempted
 
     category.create_text_channel = AsyncMock(return_value=text_channel)
     category.create_voice_channel = AsyncMock(side_effect=[vc1, RuntimeError("api fail original")])
@@ -465,8 +467,8 @@ async def test_create_match_category_rollback_survives_cascade_delete_failures()
     guild.get_member = MagicMock(return_value=None)
     guild.get_role = MagicMock(return_value=None)
 
-    # L'exception originale de creation doit etre celle propagee, pas celle
-    # du rollback (qui doit etre loggee mais swallowed).
+    # The original creation exception must be the one propagated, not the
+    # rollback one (which must be logged but swallowed).
     with pytest.raises(RuntimeError, match="api fail original"):
         await create_match_category(
             guild=guild,
@@ -475,7 +477,7 @@ async def test_create_match_category_rollback_survives_cascade_delete_failures()
             admin_role_ids=[],
         )
 
-    # Tous les delete ont ete tentes malgre les echecs en cascade.
+    # All deletes were attempted despite the cascading failures.
     text_channel.delete.assert_awaited_once()
     vc1.delete.assert_awaited_once()
     category.delete.assert_awaited_once()
@@ -483,8 +485,8 @@ async def test_create_match_category_rollback_survives_cascade_delete_failures()
 
 @pytest.mark.asyncio
 async def test_create_match_category_grants_player_level_access_to_viewer_roles():
-    """`viewer_role_ids` recoivent view/send/connect/speak (niveau joueur),
-    sans `manage_channels` (distinct des admin_role_ids).
+    """`viewer_role_ids` receive view/send/connect/speak (player level),
+    without `manage_channels` (distinct from admin_role_ids).
     """
     from services.match_category import create_match_category
 
@@ -531,14 +533,14 @@ async def test_create_match_category_grants_player_level_access_to_viewer_roles(
         assert overwrites[vrole].send_messages is True
         assert overwrites[vrole].connect is True
         assert overwrites[vrole].speak is True
-        # Niveau joueur : pas de manage_channels
+        # Player level: no manage_channels
         assert overwrites[vrole].manage_channels is None
 
 
 @pytest.mark.asyncio
 async def test_create_match_category_spectator_roles_can_view_but_not_join():
-    """`spectator_role_ids` voient la categorie et lisent l'historique,
-    mais ne peuvent ni envoyer de messages ni se connecter en vocal.
+    """`spectator_role_ids` see the category and read history, but
+    cannot send messages or join voice.
     """
     from services.match_category import create_match_category
 
@@ -569,7 +571,7 @@ async def test_create_match_category_spectator_roles_can_view_but_not_join():
         match_number=21,
         player_ids=[],
         admin_role_ids=[],
-        spectator_role_ids=[200, 888],  # 888 introuvable, doit etre skip
+        spectator_role_ids=[200, 888],  # 888 not found, must be skipped
     )
 
     overwrites = captured["overwrites"]
@@ -580,3 +582,181 @@ async def test_create_match_category_spectator_roles_can_view_but_not_join():
     assert spec_ow.send_messages is False
     assert spec_ow.connect is False
     assert spec_ow.speak is False
+
+
+@pytest.mark.asyncio
+async def test_create_match_category_hub_spectator_sees_category_voice_but_not_prep():
+    """`hub_spectator_role_ids` (e.g. FL HUB) see the category and voice
+    channels in the sidebar, but the text prep channel is fully hidden
+    (explicit view_channel=False override is posted on the prep channel).
+    They cannot join voice, send messages, or read history.
+    """
+    from services.match_category import create_match_category
+
+    captured: dict = {}
+
+    prep_channel = MagicMock(name="match-preparation")
+    prep_channel.set_permissions = AsyncMock()
+    team1_vc = MagicMock(name="team1")
+    team1_vc.set_permissions = AsyncMock()
+    team2_vc = MagicMock(name="team2")
+    team2_vc.set_permissions = AsyncMock()
+    waiting_vc = MagicMock(name="waiting")
+    waiting_vc.set_permissions = AsyncMock()
+
+    voice_calls = iter([team1_vc, team2_vc, waiting_vc])
+
+    async def fake_create_category(name, **kwargs):
+        captured["overwrites"] = kwargs.get("overwrites") or {}
+        category = MagicMock()
+        category.create_text_channel = AsyncMock(return_value=prep_channel)
+        category.create_voice_channel = AsyncMock(side_effect=lambda *a, **k: next(voice_calls))
+        return category
+
+    everyone = MagicMock(name="@everyone")
+    bot_top = MagicMock(name="bot top role")
+    fl_hub_role = MagicMock(name="FL HUB")
+    roles_by_id = {500: fl_hub_role}
+
+    guild = MagicMock()
+    guild.default_role = everyone
+    guild.me = MagicMock()
+    guild.me.top_role = bot_top
+    guild.create_category = AsyncMock(side_effect=fake_create_category)
+    guild.get_role = MagicMock(side_effect=lambda rid: roles_by_id.get(rid))
+    guild.get_member = MagicMock(return_value=None)
+
+    await create_match_category(
+        guild=guild,
+        match_number=33,
+        player_ids=[],
+        admin_role_ids=[],
+        hub_spectator_role_ids=[500, 777],  # 777 not found, must be skipped
+    )
+
+    overwrites = captured["overwrites"]
+    assert fl_hub_role in overwrites
+    hub_ow = overwrites[fl_hub_role]
+    # Category-level: sees category + voice channels, but no interaction.
+    assert hub_ow.view_channel is True
+    assert hub_ow.read_message_history is False
+    assert hub_ow.send_messages is False
+    assert hub_ow.connect is False
+    assert hub_ow.speak is False
+    assert hub_ow.manage_channels is None
+
+    # Prep channel must receive an explicit view_channel=False override
+    # for FL HUB so the text channel is hidden from them.
+    prep_channel.set_permissions.assert_awaited()
+    set_perm_calls = prep_channel.set_permissions.await_args_list
+    hub_call = next(
+        (c for c in set_perm_calls if c.args and c.args[0] is fl_hub_role),
+        None,
+    )
+    assert hub_call is not None, "FL HUB must get a per-channel overwrite on prep"
+    assert hub_call.kwargs.get("view_channel") is False
+
+    # Voice channels must NOT receive a deny-view overwrite for FL HUB
+    # (they should keep the category-inherited view=True).
+    for vc in (team1_vc, team2_vc, waiting_vc):
+        for call in vc.set_permissions.await_args_list:
+            if call.args and call.args[0] is fl_hub_role:
+                assert call.kwargs.get("view_channel") is not False, (
+                    "voice channel must remain visible to FL HUB"
+                )
+
+
+@pytest.mark.asyncio
+async def test_create_match_category_hub_spectator_skipped_when_role_missing():
+    """When no hub_spectator role resolves, no per-channel overwrite
+    is posted on the prep channel.
+    """
+    from services.match_category import create_match_category
+
+    prep_channel = MagicMock(name="match-preparation")
+    prep_channel.set_permissions = AsyncMock()
+
+    async def fake_create_category(name, **kwargs):
+        category = MagicMock()
+        category.create_text_channel = AsyncMock(return_value=prep_channel)
+        category.create_voice_channel = AsyncMock(return_value=MagicMock())
+        return category
+
+    guild = MagicMock()
+    guild.default_role = MagicMock()
+    guild.me = MagicMock()
+    guild.me.top_role = MagicMock()
+    guild.create_category = AsyncMock(side_effect=fake_create_category)
+    guild.get_role = MagicMock(return_value=None)
+    guild.get_member = MagicMock(return_value=None)
+
+    await create_match_category(
+        guild=guild,
+        match_number=34,
+        player_ids=[],
+        admin_role_ids=[],
+        hub_spectator_role_ids=[999],  # unresolved
+    )
+
+    prep_channel.set_permissions.assert_not_awaited()
+
+
+# ── Team channel naming with a queue prefix ───────────────────────
+def _category_recording_vc_names(captured: list[str]):
+    cat = MagicMock()
+    cat.create_text_channel = AsyncMock(return_value=MagicMock())
+
+    async def _vc(name, **kwargs):
+        captured.append(name)
+        return MagicMock()
+
+    cat.create_voice_channel = AsyncMock(side_effect=_vc)
+    return cat
+
+
+@pytest.mark.asyncio
+async def test_team_prefix_prepended_to_team_voice_channels():
+    from services.match_category import create_match_category
+
+    names: list[str] = []
+    cat = _category_recording_vc_names(names)
+    guild = MagicMock()
+    guild.create_category = AsyncMock(return_value=cat)
+    guild.get_member = MagicMock(return_value=None)
+
+    await create_match_category(
+        guild=guild,
+        match_number=1,
+        player_ids=[],
+        admin_role_ids=[],
+        team_prefix="Pro",
+    )
+
+    # All created channels carry the prefix: prep text + the 3 voice rooms.
+    assert cat.create_text_channel.call_args.args[0] == "Pro - match-preparation"
+    assert names[0] == "Pro - Team 1"
+    assert names[1] == "Pro - Team 2"
+    assert names[2] == "Pro - Waiting Match"
+
+
+@pytest.mark.asyncio
+async def test_no_prefix_keeps_plain_team_names():
+    from services.match_category import create_match_category
+
+    names: list[str] = []
+    cat = _category_recording_vc_names(names)
+    guild = MagicMock()
+    guild.create_category = AsyncMock(return_value=cat)
+    guild.get_member = MagicMock(return_value=None)
+
+    await create_match_category(
+        guild=guild,
+        match_number=1,
+        player_ids=[],
+        admin_role_ids=[],
+    )
+
+    assert cat.create_text_channel.call_args.args[0] == "match-preparation"
+    assert names[0] == "Team 1"
+    assert names[1] == "Team 2"
+    assert names[2] == "Waiting Match"

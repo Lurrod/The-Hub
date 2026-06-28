@@ -1,17 +1,16 @@
-"""Constantes du package cogs.match.
+"""Constants for the cogs.match package.
 
-Extraites pour eviter les imports cycliques entre _embeds, _vote et _cog,
-et pour servir de point de configuration unique du flow match.
+Extracted to avoid cyclic imports between _embeds, _vote and _cog,
+and to serve as a single configuration point for the match flow.
 """
 
 from __future__ import annotations
 
 from typing import Final
 
-
-# Ecart d'ELO max entre le joueur sortant et le remplacant. Au-dela, on
-# refuse le /match-replace : les equipes du match en cours seraient trop
-# desequilibrees pour que le resultat reflete une vraie perf des joueurs.
+# Maximum ELO gap between the leaving player and the replacement. Beyond,
+# /match-replace is refused: the teams of the ongoing match would be too
+# unbalanced for the result to reflect real player performance.
 MAX_REPLACE_ELO_DIFF: Final[int] = 500
 MATCH_HOST_ROLE_NAME: Final[str] = "Match Host"
 
@@ -19,37 +18,67 @@ VOTE_A_BTN_ID: Final[str] = "vote_v2:a"
 VOTE_B_BTN_ID: Final[str] = "vote_v2:b"
 MAJORITY_THRESHOLD: Final[int] = 7
 VOTE_TIMEOUT_MINUTES: Final[int] = 90
-HENRIK_VERIFY_DELAY_MINUTES: Final[int] = 5  # premier essai Henrik a 5 min
-HENRIK_VERIFY_TIMEOUT_MINUTES: Final[int] = 30  # abandon Henrik et ELO plat a 30 min
+HENRIK_VERIFY_DELAY_MINUTES: Final[int] = 5  # first Henrik attempt at 5 min
+HENRIK_VERIFY_TIMEOUT_MINUTES: Final[int] = 30  # give up Henrik and flat ELO at 30 min
 
-# Filet de securite : un match en "contested" non resolu par admin bloque
-# les 10 joueurs dans le gate find_active_match_for_player. /win et /lose
-# distribuent l'ELO mais ne touchent pas au doc match -> on auto-expire
-# pour eviter qu'un admin distrait gele 10 joueurs indefiniment.
+# Safety net: a "contested" match unresolved by admin blocks the 10
+# players in the find_active_match_for_player gate. /win and /lose
+# distribute ELO but do not touch the match doc -> we auto-expire
+# to avoid a distracted admin freezing 10 players indefinitely.
 CONTESTED_EXPIRY_HOURS: Final[int] = 24
 
-# Circuit breaker Henrik : si N appels consecutifs echouent, on suspend
-# les tentatives pendant T minutes pour eviter de saturer les threads
-# (chaque appel = ~12s avec retries) et de polluer les logs.
+# Henrik circuit breaker: if N consecutive calls fail, we suspend
+# attempts for T minutes to avoid saturating the threads (each call =
+# ~12s with retries) and polluting the logs.
 HENRIK_CIRCUIT_FAIL_THRESHOLD: Final[int] = 3
 HENRIK_CIRCUIT_OPEN_MINUTES: Final[int] = 5
 
-# Roles cibles pour le ping admin (premier trouve gagne)
-ADMIN_ROLE_NAMES: Final[tuple[str, ...]] = ("Admin", "Match Staff", "Administrateur")
-
-# Roles staff "viewers" : voient et participent aux categories de match
-# (memes overwrites que les 10 joueurs), mais sans `manage_channels`.
-# Distinct de ADMIN_ROLE_NAMES qui donne des pouvoirs admin (draft cancel,
-# ping, gestion de salon).
-MATCH_VIEWER_ROLE_NAMES: Final[tuple[str, ...]] = (
-    "Administrators",
-    "Moderators",
-    "Coach/Analyst/Manager",
+# Target roles for the admin ping (first found wins).
+ADMIN_ROLE_NAMES: Final[tuple[str, ...]] = (
     "Head Administrators",
+    "Administrators",
     "THE HUB",
-    "Moderator En Chef",
 )
 
-# Roles "spectateurs" : voient la categorie + lisent l'historique, mais
-# ne peuvent ni rejoindre les vocaux, ni envoyer de messages.
+# Staff "viewer" roles: see and participate in match categories
+# (same overwrites as the 10 players), but without `manage_channels`.
+# Distinct from ADMIN_ROLE_NAMES which grants admin powers (draft
+# cancel, ping, channel management).
+MATCH_VIEWER_ROLE_NAMES: Final[tuple[str, ...]] = (
+    "Head Administrators",
+    "Administrators",
+    "THE HUB",
+)
+
+# "Spectator" roles: see the category + read history, but cannot
+# join voice channels or send messages.
 MATCH_SPECTATOR_ROLE_NAMES: Final[tuple[str, ...]] = ("Members",)
+
+# "Hub spectator" roles: see the match category and voice channels but
+# cannot connect/send/read. Disabled here (no dedicated hub role on this
+# server — the Open queue is ungated).
+MATCH_HUB_SPECTATOR_ROLE_NAMES: Final[tuple[str, ...]] = ()
+
+# Per-queue channels where the bot posts the scoreboard image once a
+# match has been verified by Henrik. Missing channels are skipped
+# (warning logged) — admins create them manually.
+RESULTS_CHANNELS: Final[dict[str, str]] = {
+    "open": "open-results",
+    "advanced": "advanced-results",
+}
+
+
+# Inlined here (rather than imported from cogs.queue_v2) to avoid the
+# cyclic import cogs.queue_v2 -> cogs.match. Kept in sync manually with
+# cogs.queue_v2.QUEUE_LABELS.
+_QUEUE_LABEL_BY_TYPE: dict[str, str] = {
+    "open": "Open Queue",
+    "advanced": "Advanced Queue",
+}
+
+# Short prefix used to name the per-match team voice channels, e.g.
+# "Open - Team 1", "Advanced - Team 2".
+_QUEUE_PREFIX_BY_TYPE: dict[str, str] = {
+    "open": "Open",
+    "advanced": "Advanced",
+}
