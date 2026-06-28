@@ -1,4 +1,4 @@
-"""Tests du cog queue_v2 + repository queue."""
+"""Tests for the queue_v2 cog + repository queue."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6,8 +6,8 @@ import discord
 import pytest
 
 from cogs.queue_v2 import (
-    QueueView,
     QueueCog,
+    QueueView,
     build_queue_embed,
 )
 from services import repository
@@ -20,14 +20,15 @@ def _fake_member(member_id: int, name: str = "User"):
     m.mention = f"<@{member_id}>"
     m.roles = []
     m.voice = None
-    # Methodes async explicites - necessaires car __class__=discord.Member
-    # ci-dessous fige le type et empeche l'auto-creation d'AsyncMock.
+    # Explicit async methods - required because __class__=discord.Member
+    # below freezes the type and prevents auto-creation of AsyncMock.
     m.add_roles = AsyncMock()
     m.remove_roles = AsyncMock()
     m.move_to = AsyncMock()
-    # Marque comme discord.Member pour passer le fail-safe isinstance check
-    # dans _join_callback (gate de role).
-    m.__class__ = discord.Member
+    # Mark as discord.Member to pass the fail-safe isinstance check
+    # in _join_callback (role gate). cast to ignore the MagicMock vs
+    # Member type incompatibility from mypy's perspective.
+    m.__class__ = discord.Member  # type: ignore[assignment]
     return m
 
 
@@ -69,6 +70,30 @@ def _fake_interaction(
     return inter
 
 
+def _make_rank_role(name: str):
+    r = MagicMock()
+    r.name = name
+    return r
+
+
+def _give_queue_access(member, queue_type: str) -> None:
+    """Attach the role required to pass the gate for `queue_type`.
+
+    The Open queue is ungated (no role required); the Advanced queue is
+    gated by the "Rank Q | Advanced Queue" role.
+    """
+    role_map = {
+        "open": None,  # ungated
+        "advanced": "Rank Q | Advanced Queue",
+    }
+    role_name = role_map[queue_type]
+    if role_name is None:
+        return
+    existing = list(getattr(member, "roles", []) or [])
+    existing.append(_make_rank_role(role_name))
+    member.roles = existing
+
+
 def _seed_riot_link(db, guild_id: int, user_id: int, elo: int = 1500):
     repository.link_riot_account(
         db,
@@ -80,7 +105,7 @@ def _seed_riot_link(db, guild_id: int, user_id: int, elo: int = 1500):
         peak_elo=elo,
         source="peak_recent",
     )
-    # Compound _id pour matcher la nouvelle architecture per-queue.
+    # Compound _id matching the new per-queue architecture.
     repository.get_elo_col(db).insert_one(
         {
             "_id": f"{user_id}:open",
@@ -104,7 +129,7 @@ def _seed_active_queue(db, guild_id: int = 42, queue_type: str = "open"):
     )
 
 
-# ── Repository : add/remove ───────────────────────────────────────
+# -- Repository: add/remove --
 def test_repo_add_player_to_no_queue():
     import bot as bot_module
 
@@ -246,7 +271,7 @@ def test_repo_delete_active_queue():
     )
 
 
-# ── Embed ─────────────────────────────────────────────────────────
+# -- Embed --
 def test_embed_empty_queue():
     embed = build_queue_embed(None, _fake_guild(), "open")
     assert "0/10" in embed.title
@@ -276,23 +301,23 @@ def test_embed_forming_queue():
 
 
 def test_embed_title_per_queue_type():
-    """Chaque queue_type affiche son label dans le titre."""
+    """Every queue_type displays its label in the title."""
     g = _fake_guild()
-    pro_embed = build_queue_embed(None, g, "pro")
     open_embed = build_queue_embed(None, g, "open")
-    gc_embed = build_queue_embed(None, g, "gc")
-    assert "Pro Queue" in pro_embed.title
+    advanced_embed = build_queue_embed(None, g, "advanced")
     assert "Open Queue" in open_embed.title
-    assert "GC Queue" in gc_embed.title
+    assert "Advanced Queue" in advanced_embed.title
 
 
-# ── Bouton Rejoindre ──────────────────────────────────────────────
+# -- Join button --
 async def test_join_without_riot_account_refuses():
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
 
     await view._join_callback(inter)
 
@@ -308,11 +333,13 @@ async def test_join_no_active_queue_refuses():
 
     _seed_riot_link(bot_module.db, guild_id=42, user_id=1)
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
 
     await view._join_callback(inter)
     args, _ = inter.followup.send.call_args
-    assert "Aucune queue" in args[0]
+    assert "Aucune file active" in args[0]
 
 
 async def test_join_success_updates_message():
@@ -321,7 +348,9 @@ async def test_join_success_updates_message():
     _seed_active_queue(bot_module.db)
     _seed_riot_link(bot_module.db, guild_id=42, user_id=1)
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1, "Jet"))
+    member = _fake_member(1, "Jet")
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
 
     await view._join_callback(inter)
 
@@ -336,7 +365,9 @@ async def test_join_success_sends_ephemeral_confirmation():
     _seed_active_queue(bot_module.db)
     _seed_riot_link(bot_module.db, guild_id=42, user_id=1)
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1, "Jet"))
+    member = _fake_member(1, "Jet")
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
 
     await view._join_callback(inter)
 
@@ -362,16 +393,18 @@ async def test_join_already_in_refuses():
     )
 
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
     await view._join_callback(inter)
 
     args, _ = inter.followup.send.call_args
-    assert "deja dans la queue" in args[0]
+    assert "déjà dans la file" in args[0].lower()
 
 
 async def test_join_refused_when_player_in_active_match():
-    """Un joueur encore engage dans un match (categorie Discord active,
-    ELO pas applique) ne peut pas rejoindre une nouvelle queue."""
+    """A player still engaged in a match (active Discord category, ELO
+    not applied) cannot join a new queue."""
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
@@ -392,7 +425,9 @@ async def test_join_refused_when_player_in_active_match():
     )
 
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
     await view._join_callback(inter)
 
     args, _ = inter.followup.send.call_args
@@ -401,11 +436,11 @@ async def test_join_refused_when_player_in_active_match():
 
 
 async def test_join_allowed_when_match_validated_even_without_elo_applied():
-    """Une fois le match valide par vote (validated_a / validated_b), le joueur
-    doit pouvoir re-queue immediatement, meme si l'ELO n'est pas encore
-    applique. Sinon une defaillance Henrik (compte tracker prive, mauvais
-    compte joue, API down) bloque les 10 joueurs indefiniment. La distribution
-    ELO devient un job async independant du gate."""
+    """Once the match is validated by vote (validated_a / validated_b), the
+    player must be able to re-queue immediately, even if the ELO has not
+    been applied yet. Otherwise a Henrik outage (private tracker, wrong
+    account played, API down) blocks the 10 players indefinitely. The
+    ELO distribution becomes an async job independent from the gate."""
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
@@ -427,19 +462,21 @@ async def test_join_allowed_when_match_validated_even_without_elo_applied():
     )
 
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
     await view._join_callback(inter)
 
-    # Le joueur doit avoir ete autorise : pas de message "match en cours".
+    # The player must be authorized: no "ongoing match" message.
     if inter.followup.send.called:
         args, _ = inter.followup.send.call_args
-        assert "match en cours" not in args[0]
+        assert "ongoing match" not in args[0]
     inter.edit_original_response.assert_awaited_once()
 
 
 async def test_join_allowed_when_match_elo_already_applied():
-    """Un match dont l'ELO a deja ete applique ne doit pas bloquer la
-    queue : la categorie a ete supprimee et le joueur peut re-jouer."""
+    """A match whose ELO has already been applied must not block the
+    queue: the category has been deleted and the player can play again."""
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
@@ -459,17 +496,20 @@ async def test_join_allowed_when_match_elo_already_applied():
     )
 
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
     await view._join_callback(inter)
 
     inter.edit_original_response.assert_awaited_once()
 
 
 async def test_match_replace_releases_quitter_and_blocks_replacement():
-    """Apres /match-replace : le quitter doit pouvoir re-queue (il n'est
-    plus dans team_a/team_b) et le remplacant doit etre bloque (il y est
-    maintenant). Verrouille l'invariant entre find_active_match_for_player
-    et la mutation atomique $set sur le tableau d'equipe."""
+    """After /match-replace: the leaver must be able to re-queue (they are
+    no longer in team_a/team_b) and the replacement must be blocked (they
+    are now there). Locks the invariant between
+    find_active_match_for_player and the atomic $set mutation on the team
+    array."""
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
@@ -494,7 +534,7 @@ async def test_match_replace_releases_quitter_and_blocks_replacement():
     assert repository.find_active_match_for_player(bot_module.db, 1) is not None
     assert repository.find_active_match_for_player(bot_module.db, 99) is None
 
-    # Simule /match-replace : remplace atomiquement le contenu de team_a.
+    # Simulates /match-replace: atomically replaces the content of team_a.
     # Cf. cogs/match/_cog.py match_replace -> update_one({"_id":...,
     # "status":"pending"}, {"$set": {team_key: new_team}}).
     matches.update_one(
@@ -512,7 +552,7 @@ async def test_join_10th_player_triggers_on_full():
     _seed_active_queue(bot_module.db)
     for i in range(10):
         _seed_riot_link(bot_module.db, guild_id=42, user_id=i, elo=1500 + i * 50)
-    # 9 deja en queue
+    # 9 already in queue
     for i in range(9):
         repository.add_player_to_queue(
             bot_module.db,
@@ -527,10 +567,12 @@ async def test_join_10th_player_triggers_on_full():
         triggered.append((queue_doc, queue_type))
 
     view = QueueView(bot_module.db, queue_type="open", on_full=on_full)
-    inter = _fake_interaction(_fake_member(9))
+    member = _fake_member(9)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
     await view._join_callback(inter)
 
-    # Laisse une chance a la task de tourner
+    # Give the task a chance to run
     import asyncio
 
     await asyncio.sleep(0)
@@ -539,7 +581,7 @@ async def test_join_10th_player_triggers_on_full():
     queue_doc, queue_type = triggered[0]
     assert len(queue_doc["players"]) == 10
     assert queue_type == "open"
-    # La queue est passee en status "forming"
+    # The queue moved to status "forming"
     queue = repository.get_active_queue(
         bot_module.db,
         guild_id=42,
@@ -556,14 +598,16 @@ async def test_join_when_queue_forming_refuses():
     repository.close_active_queue(bot_module.db, guild_id=42, queue_type="open")
 
     view = QueueView(bot_module.db, queue_type="open")
-    inter = _fake_interaction(_fake_member(1))
+    member = _fake_member(1)
+    _give_queue_access(member, "open")
+    inter = _fake_interaction(member)
     await view._join_callback(inter)
 
     args, _ = inter.followup.send.call_args
-    assert "fermee" in args[0]
+    assert "fermée" in args[0].lower()
 
 
-# ── Bouton Quitter ────────────────────────────────────────────────
+# -- Leave button --
 async def test_leave_when_not_in_queue_refuses():
     import bot as bot_module
 
@@ -573,7 +617,7 @@ async def test_leave_when_not_in_queue_refuses():
 
     await view._leave_callback(inter)
     args, _ = inter.followup.send.call_args
-    assert "n'es pas dans la queue" in args[0]
+    assert "pas dans la file" in args[0].lower()
 
 
 async def test_leave_success_updates_message():
@@ -597,7 +641,7 @@ async def test_leave_success_updates_message():
     assert "0/10" in embed.title
 
 
-# ── /setup-queue ─────────────────────────────────────────────────
+# -- /setup-queue --
 async def test_setup_queue_creates_active_queue():
     import bot as bot_module
 
@@ -652,7 +696,7 @@ async def test_setup_queue_replaces_existing():
     assert new["players"] == []  # reset
 
 
-# ── /close-queue ─────────────────────────────────────────────────
+# -- /close-queue --
 async def test_close_queue_when_active():
     import bot as bot_module
 
@@ -662,7 +706,7 @@ async def test_close_queue_when_active():
     await cog.close_queue.callback(cog, inter, queue="open")
 
     args, _ = inter.response.send_message.call_args
-    assert "supprimee" in args[0]
+    assert "supprimée" in args[0].lower()
     assert (
         repository.get_active_queue(
             bot_module.db,
@@ -681,11 +725,11 @@ async def test_close_queue_when_no_queue():
     await cog.close_queue.callback(cog, inter, queue="open")
 
     args, _ = inter.response.send_message.call_args
-    assert "Aucune" in args[0]
+    assert "Aucune file" in args[0]
 
 
 async def test_setup_queue_rejects_wrong_channel():
-    """/setup-queue open dans un salon autre que #open-queue est refuse."""
+    """/setup-queue open in a channel other than #open-queue is refused."""
     import bot as bot_module
 
     cog = QueueCog(bot_module.bot, bot_module.db)
@@ -711,8 +755,9 @@ async def test_setup_queue_rejects_wrong_channel():
     )
 
 
-async def test_setup_queue_rejects_pro_in_open_channel():
-    """/setup-queue pro dans #open-queue est refuse (par type de queue)."""
+async def test_setup_queue_rejects_advanced_in_open_channel():
+    """/setup-queue advanced in #open-queue is refused (wrong queue type
+    for the channel: advanced must be set up in #advanced-queue)."""
     import bot as bot_module
 
     cog = QueueCog(bot_module.bot, bot_module.db)
@@ -721,15 +766,15 @@ async def test_setup_queue_rejects_pro_in_open_channel():
         channel_name="open-queue",
     )
 
-    await cog.setup_queue.callback(cog, inter, queue="pro")
+    await cog.setup_queue.callback(cog, inter, queue="advanced")
 
     args, _ = inter.response.send_message.call_args
-    assert "pro-queue" in args[0]
+    assert "advanced-queue" in args[0]
     inter.channel.send.assert_not_awaited()
 
 
 async def test_close_queue_deletes_persistent_message():
-    """/close-queue supprime le message Rejoindre/Quitter dans Discord."""
+    """/close-queue deletes the Join/Leave message in Discord."""
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
@@ -759,9 +804,11 @@ async def test_close_queue_deletes_persistent_message():
 
 
 async def test_close_queue_tolerates_missing_message():
-    """Si le message a deja ete supprime cote Discord, /close-queue
-    ne plante pas et retire quand meme la queue de la DB."""
+    """If the message has already been deleted on the Discord side,
+    /close-queue does not crash and still removes the queue from the
+    DB."""
     import discord as _discord
+
     import bot as bot_module
 
     _seed_active_queue(bot_module.db)
@@ -778,7 +825,7 @@ async def test_close_queue_tolerates_missing_message():
     await cog.close_queue.callback(cog, inter, queue="open")
 
     args, _ = inter.response.send_message.call_args
-    assert "supprimee" in args[0]
+    assert "supprimée" in args[0].lower()
     assert (
         repository.get_active_queue(
             bot_module.db,
@@ -789,26 +836,25 @@ async def test_close_queue_tolerates_missing_message():
     )
 
 
-# ── Custom IDs des boutons (pour persistance) ──────────────────────
+# -- Button custom IDs (for persistence) --
 async def test_button_custom_ids_per_queue_type():
-    """Les custom_ids portent le queue_type pour permettre la cohabitation
-    des 3 messages persistants apres restart du bot."""
+    """The custom_ids carry the queue_type to allow the 4 persistent
+    messages to coexist after a bot restart."""
     db = MagicMock()
-    pro = QueueView(db, queue_type="pro")
-    open_v = QueueView(db, queue_type="open")
-    gc = QueueView(db, queue_type="gc")
-    assert pro.join_btn.custom_id == "queue_v2:join:pro"
-    assert pro.leave_btn.custom_id == "queue_v2:leave:pro"
-    assert open_v.join_btn.custom_id == "queue_v2:join:open"
-    assert open_v.leave_btn.custom_id == "queue_v2:leave:open"
-    assert gc.join_btn.custom_id == "queue_v2:join:gc"
-    assert gc.leave_btn.custom_id == "queue_v2:leave:gc"
+    open_view = QueueView(db, queue_type="open")
+    advanced = QueueView(db, queue_type="advanced")
+    assert open_view.join_btn.custom_id == "queue_v2:join:open"
+    assert open_view.leave_btn.custom_id == "queue_v2:leave:open"
+    assert advanced.join_btn.custom_id == "queue_v2:join:advanced"
+    assert advanced.leave_btn.custom_id == "queue_v2:leave:advanced"
 
 
-# ── Tests Task 9 : 3-queue system ────────────────────────────────
-async def test_join_pro_queue_requires_role():
-    """Sans role 'Rank S | Pro Queue', refus de rejoindre Pro Queue."""
+# -- Tests Task 9: 4-queue system --
+async def test_join_advanced_queue_requires_role():
+    """Without the 'Rank Q | Advanced Queue' role, joining the Advanced
+    Queue is refused."""
     import discord
+
     import bot as bot_module
     from cogs.queue_v2 import QueueView
 
@@ -816,29 +862,34 @@ async def test_join_pro_queue_requires_role():
     repository.setup_active_queue(
         db,
         guild_id=42,
-        queue_type="pro",
+        queue_type="advanced",
         channel_id=100,
         message_id=999,
     )
     _seed_riot_link(db, 42, 1)
 
     member = _fake_member(1)
-    member.roles = []  # pas de role Pro
+    member.roles = []  # no Advanced Queue role
     member.__class__ = discord.Member
     inter = _fake_interaction(member)
     inter.user = member
 
-    view = QueueView(db, queue_type="pro")
+    view = QueueView(db, queue_type="advanced")
     await view._join_callback(inter)
 
     inter.followup.send.assert_called()
     msg = inter.followup.send.call_args[0][0]
-    assert "Rank S" in msg or "Pro Queue" in msg
+    assert "Rank Q | Advanced Queue" in msg
+    assert "réservée" in msg
+    # The player must NOT have been added to the gated queue.
+    doc = repository.get_active_queue(db, 42, "advanced")
+    assert "1" not in doc["players"]
 
 
-async def test_cannot_join_two_queues_simultaneously():
-    """Si dans Pro Queue, refus de rejoindre Open Queue."""
+async def test_join_advanced_queue_allowed_with_role():
+    """With the 'Rank Q | Advanced Queue' role, joining is allowed."""
     import discord
+
     import bot as bot_module
     from cogs.queue_v2 import QueueView
 
@@ -846,42 +897,108 @@ async def test_cannot_join_two_queues_simultaneously():
     repository.setup_active_queue(
         db,
         guild_id=42,
-        queue_type="pro",
+        queue_type="advanced",
+        channel_id=100,
+        message_id=999,
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    member.roles = [_make_rank_role("Rank Q | Advanced Queue")]
+    member.__class__ = discord.Member
+    inter = _fake_interaction(member, channel_name="advanced-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="advanced")
+    await view._join_callback(inter)
+
+    doc = repository.get_active_queue(db, 42, "advanced")
+    assert "1" in doc["players"]
+
+
+async def test_join_open_queue_is_ungated():
+    """Open Queue has no role gate: any linked player can join without
+    holding any special role."""
+    import discord
+
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db,
+        guild_id=42,
+        queue_type="open",
+        channel_id=100,
+        message_id=999,
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    member.roles = []  # no role at all
+    member.__class__ = discord.Member
+    inter = _fake_interaction(member, channel_name="open-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="open")
+    await view._join_callback(inter)
+
+    # Join succeeds despite holding no role (open is ungated).
+    doc = repository.get_active_queue(db, 42, "open")
+    assert "1" in doc["players"]
+
+
+async def test_cannot_join_two_queues_simultaneously():
+    """If already in the Open Queue, joining the Advanced Queue is refused."""
+    import discord
+
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db,
+        guild_id=42,
+        queue_type="open",
         channel_id=100,
         message_id=999,
     )
     repository.setup_active_queue(
         db,
         guild_id=42,
-        queue_type="open",
+        queue_type="advanced",
         channel_id=200,
         message_id=888,
     )
     repository.add_player_to_queue(
         db,
         guild_id=42,
-        queue_type="pro",
+        queue_type="open",
         user_id=1,
     )
     _seed_riot_link(db, 42, 1)
 
     member = _fake_member(1)
-    member.roles = []
+    _give_queue_access(member, "advanced")
     member.__class__ = discord.Member
     inter = _fake_interaction(member)
     inter.user = member
 
-    view_open = QueueView(db, queue_type="open")
-    await view_open._join_callback(inter)
+    view_advanced = QueueView(db, queue_type="advanced")
+    await view_advanced._join_callback(inter)
 
     inter.followup.send.assert_called()
     msg = inter.followup.send.call_args[0][0]
-    assert "deja" in msg.lower() or "autre queue" in msg.lower()
+    # Cross-queue refusal: already in OPEN, cannot join ADVANCED.
+    assert "déjà dans la file **OPEN**" in msg
+    # And the player was not added to the advanced queue.
+    doc = repository.get_active_queue(db, 42, "advanced")
+    assert "1" not in doc["players"]
 
 
 @pytest.mark.asyncio
 async def test_join_rejects_non_member_user():
-    """Si inter.user n'est pas un Member, refus du join (fail-safe)."""
+    """If inter.user is not a Member, the join is refused (fail-safe)."""
     import bot as bot_module
     from cogs.queue_v2 import QueueView
 
@@ -895,53 +1012,188 @@ async def test_join_rejects_non_member_user():
     )
     _seed_riot_link(db, 42, 1)
 
-    user = MagicMock()  # Pas un discord.Member
+    user = MagicMock()  # Not a discord.Member
     user.id = 1
     user.display_name = "User"
     user.mention = "<@1>"
-    # IMPORTANT : ne PAS set user.__class__ = discord.Member
+    # IMPORTANT: do NOT set user.__class__ = discord.Member
     inter = _fake_interaction(user)
     inter.user = user
 
     view = QueueView(db, queue_type="open")
     await view._join_callback(inter)
 
-    # Le join doit etre refuse avec un message clair
+    # The join must be refused with a clear message
     inter.followup.send.assert_called()
     msg = inter.followup.send.call_args[0][0]
-    assert "invalide" in msg.lower() or "serveur" in msg.lower()
+    assert "invalid" in msg.lower() or "server" in msg.lower()
 
 
 def test_waiting_room_name_per_queue_type():
     from cogs.queue_v2 import WAITING_ROOM_NAMES
 
-    assert WAITING_ROOM_NAMES["pro"] == "Waiting Room Pro"
     assert WAITING_ROOM_NAMES["open"] == "Waiting Room Open"
-    assert WAITING_ROOM_NAMES["gc"] == "Waiting Room GC"
+    assert WAITING_ROOM_NAMES["advanced"] == "Waiting Room Advanced"
 
 
-def _make_rank_role(name: str):
-    r = MagicMock()
-    r.name = name
-    return r
+def test_queue_role_gates_per_queue_type():
+    """Snapshot of QUEUE_ROLE_GATES: Open is ungated (None), Advanced is
+    gated by the "Rank Q | Advanced Queue" role. FL CAST is NOT a queue
+    gate — casters access match channels via MATCH_VIEWER_ROLE_NAMES."""
+    from cogs.queue_v2 import QUEUE_ROLE_GATES
+
+    assert QUEUE_ROLE_GATES["open"] is None
+    assert QUEUE_ROLE_GATES["advanced"] == ("Rank Q | Advanced Queue",)
 
 
-async def test_join_pro_queue_allowed_with_rank_s():
-    """Pro Queue : join OK avec le role Rank S (plus de gate reglement)."""
+def test_queue_channel_names_per_queue_type():
+    from cogs.queue_v2 import QUEUE_CHANNEL_NAMES
+
+    assert QUEUE_CHANNEL_NAMES["open"] == "open-queue"
+    assert QUEUE_CHANNEL_NAMES["advanced"] == "advanced-queue"
+    assert QUEUE_CHANNEL_NAMES["open"] == "open-queue"
+    assert QUEUE_CHANNEL_NAMES["advanced"] == "advanced-queue"
+
+
+def test_queue_labels_per_queue_type():
+    from cogs.queue_v2 import QUEUE_LABELS
+
+    assert QUEUE_LABELS["open"] == "Open Queue"
+    assert QUEUE_LABELS["advanced"] == "Advanced Queue"
+
+
+def test_queue_role_name_is_en_queue():
+    from cogs.queue_v2 import QUEUE_ROLE_NAME
+
+    assert QUEUE_ROLE_NAME == "En Queue"
+
+
+async def test_join_pro_queue_allowed_with_fl_pro_role():
+    """Pro Queue: join OK with the FL PRO role (single-role gate)."""
     import bot as bot_module
     from cogs.queue_v2 import QueueView
 
     db = bot_module.db
-    repository.setup_active_queue(db, guild_id=42, queue_type="pro", channel_id=100, message_id=999)
+    repository.setup_active_queue(
+        db, guild_id=42, queue_type="open", channel_id=100, message_id=999
+    )
     _seed_riot_link(db, 42, 1)
 
     member = _fake_member(1)
-    member.roles = [_make_rank_role("Rank S | Pro Queue")]
-    inter = _fake_interaction(member, channel_name="pro-queue")
+    member.roles = [_make_rank_role("FL PRO")]
+    inter = _fake_interaction(member, channel_name="open-queue")
     inter.user = member
 
-    view = QueueView(db, queue_type="pro")
+    view = QueueView(db, queue_type="open")
     await view._join_callback(inter)
 
-    doc = repository.get_active_queue(db, 42, "pro")
+    doc = repository.get_active_queue(db, 42, "open")
     assert "1" in doc["players"]
+
+
+async def test_join_open_queue_allowed_with_fl_open_role():
+    """Open Queue: join OK with the FL OPEN role."""
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db, guild_id=42, queue_type="open", channel_id=100, message_id=999
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    member.roles = [_make_rank_role("FL OPEN")]
+    inter = _fake_interaction(member, channel_name="open-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="open")
+    await view._join_callback(inter)
+
+    doc = repository.get_active_queue(db, 42, "open")
+    assert "1" in doc["players"]
+
+
+async def test_join_advanced_queue_refused_with_unrelated_staff_role():
+    """Advanced Queue: an unrelated staff role (e.g. 'FL STAFF') does not
+    satisfy the 'Rank Q | Advanced Queue' gate, so the join is refused."""
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db, guild_id=42, queue_type="advanced", channel_id=100, message_id=999
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    member.roles = [_make_rank_role("FL STAFF")]
+    inter = _fake_interaction(member, channel_name="advanced-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="advanced")
+    await view._join_callback(inter)
+
+    doc = repository.get_active_queue(db, 42, "advanced")
+    assert "1" not in doc["players"]
+
+
+async def test_join_semipro_queue_refused_with_fl_staff_semipro_role():
+    """Semi Pro Queue: FL STAFF SEMIPRO alone is no longer a queue gate."""
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db, guild_id=42, queue_type="advanced", channel_id=100, message_id=999
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    member.roles = [_make_rank_role("FL STAFF SEMIPRO")]
+    inter = _fake_interaction(member, channel_name="advanced-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="advanced")
+    await view._join_callback(inter)
+
+    doc = repository.get_active_queue(db, 42, "advanced")
+    assert "1" not in doc["players"]
+
+
+async def test_join_gc_queue_refused_with_fl_staff_gc_role():
+    """GC Queue: FL STAFF GC alone is no longer a queue gate."""
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db, guild_id=42, queue_type="advanced", channel_id=100, message_id=999
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    member.roles = [_make_rank_role("FL STAFF GC")]
+    inter = _fake_interaction(member, channel_name="advanced-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="advanced")
+    await view._join_callback(inter)
+
+    doc = repository.get_active_queue(db, 42, "advanced")
+    assert "1" not in doc["players"]
+
+
+def test_viewer_roles_are_not_queue_gates():
+    """Staff/viewer roles (MATCH_VIEWER_ROLE_NAMES) can see match channels
+    and join voice rooms, but are NOT in QUEUE_ROLE_GATES: holding a viewer
+    role alone must not let someone queue up as a player."""
+    from cogs.match._constants import MATCH_VIEWER_ROLE_NAMES
+    from cogs.queue_v2 import QUEUE_ROLE_GATES
+
+    assert MATCH_VIEWER_ROLE_NAMES  # there is at least one viewer role
+    for queue_type, gate in QUEUE_ROLE_GATES.items():
+        if gate is None:
+            continue  # ungated queue has no role gate to check
+        for viewer_role in MATCH_VIEWER_ROLE_NAMES:
+            assert viewer_role not in gate, f"{viewer_role} must not gate the {queue_type} queue"

@@ -1,4 +1,4 @@
-"""Tests des helpers Riot ID."""
+"""Tests for the Riot ID helpers."""
 
 import pytest
 

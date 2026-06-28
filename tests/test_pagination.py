@@ -1,8 +1,8 @@
 """
-Tests unitaires de la logique de pagination (sans Discord, sans MongoDB).
+Unit tests of the pagination logic (no Discord, no MongoDB).
 
-Ces tests valident UNIQUEMENT le calcul du nombre de pages et les bornes
-de navigation. Ils ne peuvent pas detecter un bug dans l'API Discord.
+These tests validate ONLY the page count computation and the navigation
+bounds. They cannot detect a bug in the Discord API.
 
 Usage:
     pip install pytest
@@ -11,12 +11,11 @@ Usage:
 
 import pytest
 
-
 PAGE_SIZE = 15
 
 
 def total_pages(n_players: int) -> int:
-    """Reproduit le calcul du bot (ligne 215 du fichier original)."""
+    """Reproduces the bot's computation (line 215 of the original file)."""
     return max(1, (n_players + PAGE_SIZE - 1) // PAGE_SIZE)
 
 
@@ -29,20 +28,20 @@ def is_next_disabled(page: int, total: int) -> bool:
 
 
 def clamp_page(new_page: int, total: int) -> int | None:
-    """Renvoie None si le clic doit etre ignore (hors bornes)."""
+    """Return None if the click must be ignored (out of bounds)."""
     if new_page < 0 or new_page >= total:
         return None
     return new_page
 
 
-# ── Tests : nombre de pages ───────────────────────────────────────
+# -- Tests: page count --
 @pytest.mark.parametrize(
     "n,expected",
     [
-        (0, 1),  # liste vide -> 1 page (default)
-        (1, 1),  # 1 joueur -> 1 page
-        (15, 1),  # exactement PAGE_SIZE -> 1 page
-        (16, 2),  # 1 de plus -> 2 pages
+        (0, 1),  # empty list -> 1 page (default)
+        (1, 1),  # 1 player -> 1 page
+        (15, 1),  # exactly PAGE_SIZE -> 1 page
+        (16, 2),  # one more -> 2 pages
         (29, 2),
         (30, 2),
         (31, 3),
@@ -54,7 +53,7 @@ def test_total_pages(n, expected):
     assert total_pages(n) == expected
 
 
-# ── Tests : etat des boutons ──────────────────────────────────────
+# -- Tests: button state --
 def test_prev_disabled_on_first_page():
     assert is_prev_disabled(0) is True
 
@@ -79,7 +78,7 @@ def test_both_disabled_when_only_one_page():
     assert is_next_disabled(0, total=1) is True
 
 
-# ── Tests : navigation (clamp) ────────────────────────────────────
+# -- Tests: navigation (clamp) --
 def test_clamp_valid_page():
     assert clamp_page(2, total=5) == 2
 
@@ -101,7 +100,7 @@ def test_clamp_above_total_rejected():
     assert clamp_page(99, total=5) is None
 
 
-# ── Tests : decoupage en chunks ───────────────────────────────────
+# -- Tests: chunk splitting --
 def test_chunk_first_page():
     players = list(range(30))
     page = 0
@@ -117,11 +116,11 @@ def test_chunk_second_page():
 
 
 def test_chunk_partial_last_page():
-    """Cas ou la derniere page n'est pas pleine - ATTENTION, peut casser
-    generate_leaderboard si elle n'est pas tolerante aux chunks de taille variable."""
+    """Case where the last page is not full - WARNING, may break
+    generate_leaderboard if it is not tolerant to variable-sized chunks."""
     players = list(range(16))
     chunk_p2 = players[15:30]
-    assert len(chunk_p2) == 1, "La page 2 ne contient qu'1 joueur ici"
+    assert len(chunk_p2) == 1, "Page 2 contains only 1 player here"
 
 
 def test_chunk_empty_when_out_of_bounds():
@@ -130,7 +129,7 @@ def test_chunk_empty_when_out_of_bounds():
     assert chunk == []
 
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import mongomock
@@ -146,23 +145,24 @@ async def test_build_leaderboard_payload_filters_by_queue_type():
     col.insert_many(
         [
             {
-                "_id": player_doc_id(1, "pro"),
+                "_id": player_doc_id(1, "open"),
                 "user_id": "1",
                 "name": "A",
                 "elo": 2500,
                 "wins": 5,
                 "losses": 1,
-                "queue_type": "pro",
+                "queue_type": "open",
                 "last_played": datetime.now(UTC),
             },
             {
-                "_id": player_doc_id(1, "open"),
-                "user_id": "1",
-                "name": "A",
+                "_id": player_doc_id(2, "open"),
+                "user_id": "2",
+                "name": "B",
                 "elo": 1500,
                 "wins": 1,
                 "losses": 5,
                 "queue_type": "open",
+                "last_played": datetime.now(UTC),
             },
         ]
     )
@@ -175,20 +175,95 @@ async def test_build_leaderboard_payload_filters_by_queue_type():
     fake_member.display_avatar.replace.return_value.url = "http://av/1.png"
     guild.get_member.return_value = fake_member
 
-    file_pro, _ = await build_leaderboard_payload(guild, db, queue_type="pro")
+    file_pro, _ = await build_leaderboard_payload(guild, db, queue_type="open")
+    file_semipro, _ = await build_leaderboard_payload(guild, db, queue_type="advanced")
     file_open, _ = await build_leaderboard_payload(guild, db, queue_type="open")
-    file_gc, _ = await build_leaderboard_payload(guild, db, queue_type="gc")
+    file_gc, _ = await build_leaderboard_payload(guild, db, queue_type="advanced")
 
     assert file_pro is not None
     assert file_open is not None
+    assert file_semipro is None  # 0 players in Semi Pro
     assert file_gc is None  # 0 players in GC
 
 
-# ── Cache de pages rendues ────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_build_leaderboard_payload_hides_inactive_players():
+    """A player inactive > 7 days (or never played) is excluded; if all
+    players in a queue are inactive, the leaderboard is empty (None)."""
+    from services import leaderboard_refresh
+    from services.leaderboard_refresh import build_leaderboard_payload
+    from services.repository import get_elo_col, player_doc_id
+
+    leaderboard_refresh._clear_page_cache_for_tests()
+    db = mongomock.MongoClient(tz_aware=True).db
+    col = get_elo_col(db)
+    now = datetime.now(UTC)
+    col.insert_many(
+        [
+            {  # active: played 2 days ago
+                "_id": player_doc_id(1, "open"),
+                "user_id": "1",
+                "name": "Active",
+                "elo": 2300,
+                "wins": 4,
+                "losses": 1,
+                "queue_type": "open",
+                "last_played": now - timedelta(days=2),
+            },
+            {  # inactive: played 8 days ago
+                "_id": player_doc_id(2, "open"),
+                "user_id": "2",
+                "name": "Stale",
+                "elo": 2600,
+                "wins": 9,
+                "losses": 0,
+                "queue_type": "open",
+                "last_played": now - timedelta(days=8),
+            },
+            {  # never played: no last_played
+                "_id": player_doc_id(3, "open"),
+                "user_id": "3",
+                "name": "Newbie",
+                "elo": 2000,
+                "wins": 0,
+                "losses": 0,
+                "queue_type": "open",
+            },
+        ]
+    )
+
+    captured: list[list[dict]] = []
+    real_gen = leaderboard_refresh.generate_leaderboard
+
+    def spy_gen(players, **kwargs):
+        captured.append(list(players))
+        return real_gen(players, **kwargs)
+
+    guild = MagicMock()
+    guild.id = 7
+    guild.name = "TestGuild"
+    fake_member = MagicMock()
+    fake_member.display_name = "X"
+    fake_member.display_avatar.replace.return_value.url = "http://av/x.png"
+    guild.get_member.return_value = fake_member
+
+    leaderboard_refresh.generate_leaderboard = spy_gen
+    try:
+        file_pro, _ = await build_leaderboard_payload(guild, db, queue_type="open")
+    finally:
+        leaderboard_refresh.generate_leaderboard = real_gen
+
+    assert file_pro is not None
+    # Only the active player is rendered (Stale @8d and Newbie/never excluded).
+    assert len(captured[0]) == 1
+    assert captured[0][0]["elo"] == 2300  # the active player's ELO
+
+
+# -- Rendered page cache --
 #
-# Tests du cache lazy ajoute dans services/leaderboard_refresh.py.
-# Chaque test commence par vider le cache global (process-wide) pour
-# garantir l'isolation entre cas.
+# Tests of the lazy cache added in services/leaderboard_refresh.py.
+# Every test starts by emptying the global (process-wide) cache to
+# guarantee isolation between cases.
 
 
 def _make_guild_with_member(guild_id: int = 99):
@@ -207,32 +282,21 @@ def _seed_pro_open(db, guild_id: int, n: int = 1) -> None:
 
     col = get_elo_col(db)
     docs = []
-    # User IDs offset par guild pour eviter les collisions dans la collection
-    # `elo` partagee (post-refactor shared collections).
+    # User IDs offset per guild to avoid collisions in the shared `elo`
+    # collection (post-refactor shared collections).
     offset = guild_id * 1000
     for i in range(1, n + 1):
         uid = offset + i
         docs.append(
             {
-                "_id": player_doc_id(uid, "pro"),
+                "_id": player_doc_id(uid, "open"),
                 "user_id": str(uid),
                 "name": f"P{uid}",
                 "elo": 2500 + i,
                 "wins": 5,
                 "losses": 0,
-                "queue_type": "pro",
-                "last_played": datetime.now(UTC),
-            }
-        )
-        docs.append(
-            {
-                "_id": player_doc_id(uid, "open"),
-                "user_id": str(uid),
-                "name": f"P{uid}",
-                "elo": 2000 + i,
-                "wins": 1,
-                "losses": 0,
                 "queue_type": "open",
+                "last_played": datetime.now(UTC),
             }
         )
     col.insert_many(docs)
@@ -240,7 +304,7 @@ def _seed_pro_open(db, guild_id: int, n: int = 1) -> None:
 
 @pytest.mark.asyncio
 async def test_page_cache_hit_skips_render():
-    """2e appel sur la meme page ne doit pas re-rendre via PIL."""
+    """A 2nd call on the same page must not re-render via PIL."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import build_leaderboard_payload
 
@@ -259,22 +323,22 @@ async def test_page_cache_hit_skips_render():
 
     leaderboard_refresh.generate_leaderboard = counting_gen
     try:
-        file1, _ = await build_leaderboard_payload(guild, db, queue_type="pro")
-        file2, _ = await build_leaderboard_payload(guild, db, queue_type="pro")
+        file1, _ = await build_leaderboard_payload(guild, db, queue_type="open")
+        file2, _ = await build_leaderboard_payload(guild, db, queue_type="open")
     finally:
         leaderboard_refresh.generate_leaderboard = real_gen
 
     assert file1 is not None and file2 is not None
     assert call_count["n"] == 1, (
-        f"generate_leaderboard appele {call_count['n']}x au lieu de 1 "
-        "(cache hit attendu sur le 2eme appel)"
+        f"generate_leaderboard called {call_count['n']}x instead of 1 "
+        "(cache hit expected on 2nd call)"
     )
 
 
 @pytest.mark.asyncio
 async def test_page_cache_returns_fresh_bytesio_per_call():
-    """Cache stocke des bytes, pas un BytesIO. Chaque hit doit produire
-    un discord.File lisible (BytesIO frais cote interne)."""
+    """Cache stores bytes, not a BytesIO. Every hit must produce a
+    readable discord.File (fresh internal BytesIO)."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import build_leaderboard_payload
 
@@ -284,11 +348,11 @@ async def test_page_cache_returns_fresh_bytesio_per_call():
     _seed_pro_open(db, 99)
     guild = _make_guild_with_member(99)
 
-    file1, _ = await build_leaderboard_payload(guild, db, queue_type="pro")
-    file2, _ = await build_leaderboard_payload(guild, db, queue_type="pro")
+    file1, _ = await build_leaderboard_payload(guild, db, queue_type="open")
+    file2, _ = await build_leaderboard_payload(guild, db, queue_type="open")
 
-    # Les deux discord.File doivent etre des objets distincts (BytesIO neufs)
-    # et contenir des bytes lisibles -> sinon le 2eme send Discord echoue.
+    # The two discord.File objects must be distinct (fresh BytesIO) and
+    # contain readable bytes -> otherwise the 2nd Discord send fails.
     bytes1 = file1.fp.read()
     bytes2 = file2.fp.read()
     assert bytes1 == bytes2
@@ -297,13 +361,13 @@ async def test_page_cache_returns_fresh_bytesio_per_call():
 
 @pytest.mark.asyncio
 async def test_page_cache_invalidation_clears_queue_entries():
-    """_cache_invalidate(g, qt) doit vider TOUTES les entrees de ce
-    (guild, queue_type), peu importe la page."""
+    """_cache_invalidate(g, qt) must clear ALL entries for that
+    (guild, queue_type), whatever the page."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import (
-        build_leaderboard_payload,
-        _cache_invalidate,
         _PAGE_CACHE,
+        _cache_invalidate,
+        build_leaderboard_payload,
     )
 
     leaderboard_refresh._clear_page_cache_for_tests()
@@ -312,52 +376,66 @@ async def test_page_cache_invalidation_clears_queue_entries():
     _seed_pro_open(db, 99, n=20)  # > 15 -> 2 pages
     guild = _make_guild_with_member(99)
 
-    await build_leaderboard_payload(guild, db, queue_type="pro", page=0)
-    await build_leaderboard_payload(guild, db, queue_type="pro", page=1)
-    assert (99, "pro", 0) in _PAGE_CACHE
-    assert (99, "pro", 1) in _PAGE_CACHE
+    await build_leaderboard_payload(guild, db, queue_type="open", page=0)
+    await build_leaderboard_payload(guild, db, queue_type="open", page=1)
+    assert (99, "open", 0) in _PAGE_CACHE
+    assert (99, "open", 1) in _PAGE_CACHE
 
-    removed = _cache_invalidate(99, "pro")
+    removed = _cache_invalidate(99, "open")
     assert removed == 2
-    assert (99, "pro", 0) not in _PAGE_CACHE
-    assert (99, "pro", 1) not in _PAGE_CACHE
+    assert (99, "open", 0) not in _PAGE_CACHE
+    assert (99, "open", 1) not in _PAGE_CACHE
 
 
 @pytest.mark.asyncio
 async def test_page_cache_invalidation_is_per_queue():
-    """Invalider Pro ne doit PAS toucher Open ou GC."""
+    """Invalidating Open must NOT affect Advanced."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import (
-        build_leaderboard_payload,
-        _cache_invalidate,
         _PAGE_CACHE,
+        _cache_invalidate,
+        build_leaderboard_payload,
     )
+    from services.repository import get_elo_col, player_doc_id
 
     leaderboard_refresh._clear_page_cache_for_tests()
 
     db = mongomock.MongoClient(tz_aware=True).db
     _seed_pro_open(db, 99)
+    # Seed an Advanced-queue player so the advanced leaderboard renders too.
+    get_elo_col(db).insert_one(
+        {
+            "_id": player_doc_id(99001, "advanced"),
+            "user_id": "99001",
+            "name": "Adv",
+            "elo": 2500,
+            "wins": 5,
+            "losses": 0,
+            "queue_type": "advanced",
+            "last_played": datetime.now(UTC),
+        }
+    )
     guild = _make_guild_with_member(99)
 
-    await build_leaderboard_payload(guild, db, queue_type="pro")
     await build_leaderboard_payload(guild, db, queue_type="open")
-    assert (99, "pro", 0) in _PAGE_CACHE
+    await build_leaderboard_payload(guild, db, queue_type="advanced")
     assert (99, "open", 0) in _PAGE_CACHE
+    assert (99, "advanced", 0) in _PAGE_CACHE
 
-    removed = _cache_invalidate(99, "pro")
+    removed = _cache_invalidate(99, "open")
     assert removed == 1
-    assert (99, "pro", 0) not in _PAGE_CACHE
-    assert (99, "open", 0) in _PAGE_CACHE, "Open ne doit PAS etre invalide"
+    assert (99, "open", 0) not in _PAGE_CACHE
+    assert (99, "advanced", 0) in _PAGE_CACHE, "Advanced must NOT be invalidated"
 
 
 @pytest.mark.asyncio
 async def test_page_cache_invalidation_is_per_guild():
-    """Invalider guild 99 ne doit PAS toucher guild 100."""
+    """Invalidating guild 99 must NOT affect guild 100."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import (
-        build_leaderboard_payload,
-        _cache_invalidate,
         _PAGE_CACHE,
+        _cache_invalidate,
+        build_leaderboard_payload,
     )
 
     leaderboard_refresh._clear_page_cache_for_tests()
@@ -366,67 +444,65 @@ async def test_page_cache_invalidation_is_per_guild():
     _seed_pro_open(db, 99)
     _seed_pro_open(db, 100)
 
-    await build_leaderboard_payload(_make_guild_with_member(99), db, queue_type="pro")
-    await build_leaderboard_payload(_make_guild_with_member(100), db, queue_type="pro")
-    assert (99, "pro", 0) in _PAGE_CACHE
-    assert (100, "pro", 0) in _PAGE_CACHE
+    await build_leaderboard_payload(_make_guild_with_member(99), db, queue_type="open")
+    await build_leaderboard_payload(_make_guild_with_member(100), db, queue_type="open")
+    assert (99, "open", 0) in _PAGE_CACHE
+    assert (100, "open", 0) in _PAGE_CACHE
 
-    _cache_invalidate(99, "pro")
-    assert (99, "pro", 0) not in _PAGE_CACHE
-    assert (100, "pro", 0) in _PAGE_CACHE, (
-        "Le cache d'une autre guild ne doit pas etre touche"
-    )
+    _cache_invalidate(99, "open")
+    assert (99, "open", 0) not in _PAGE_CACHE
+    assert (100, "open", 0) in _PAGE_CACHE, "Another guild's cache must not be touched"
 
 
 def test_page_cache_lru_eviction():
-    """Au-dela de _PAGE_CACHE_MAXSIZE, le plus ancien (FIFO) est evicte."""
+    """Beyond _PAGE_CACHE_MAXSIZE, the oldest (FIFO) entry is evicted."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import (
-        _cache_set,
         _PAGE_CACHE,
         _PAGE_CACHE_MAXSIZE,
+        _cache_set,
     )
 
     leaderboard_refresh._clear_page_cache_for_tests()
 
-    # Remplit jusqu'a la limite : (guild_id varie pour generer des cles uniques)
+    # Fill up to the limit: (guild_id varies to generate unique keys)
     for g in range(_PAGE_CACHE_MAXSIZE):
-        _cache_set(g, "pro", 0, b"x", 1)
+        _cache_set(g, "open", 0, b"x", 1)
     assert len(_PAGE_CACHE) == _PAGE_CACHE_MAXSIZE
-    assert (0, "pro", 0) in _PAGE_CACHE
+    assert (0, "open", 0) in _PAGE_CACHE
 
-    # Ajout d'une entree de plus -> le plus ancien (guild=0) est evince
-    _cache_set(_PAGE_CACHE_MAXSIZE, "pro", 0, b"x", 1)
+    # Add one more entry -> the oldest (guild=0) is evicted
+    _cache_set(_PAGE_CACHE_MAXSIZE, "open", 0, b"x", 1)
     assert len(_PAGE_CACHE) == _PAGE_CACHE_MAXSIZE
-    assert (0, "pro", 0) not in _PAGE_CACHE
-    assert (_PAGE_CACHE_MAXSIZE, "pro", 0) in _PAGE_CACHE
+    assert (0, "open", 0) not in _PAGE_CACHE
+    assert (_PAGE_CACHE_MAXSIZE, "open", 0) in _PAGE_CACHE
 
 
 def test_page_cache_get_promotes_lru_order():
-    """Un cache hit doit promouvoir la cle au plus recent (anti-eviction)."""
+    """A cache hit must promote the key to most-recent (anti-eviction)."""
     from services import leaderboard_refresh
     from services.leaderboard_refresh import (
-        _cache_set,
-        _cache_get,
         _PAGE_CACHE,
+        _cache_get,
+        _cache_set,
     )
 
     leaderboard_refresh._clear_page_cache_for_tests()
 
-    # Remplit la moitie de la limite avec des cles distinctes
+    # Fill half the limit with distinct keys
     for g in range(3):
-        _cache_set(g, "pro", 0, b"x", 1)
+        _cache_set(g, "open", 0, b"x", 1)
 
-    # Hit sur la plus ancienne (g=0) -> elle devient la plus recente
-    assert _cache_get(0, "pro", 0) is not None
+    # Hit on the oldest (g=0) -> it becomes the most-recent
+    assert _cache_get(0, "open", 0) is not None
 
-    # Verifie qu'elle est bien en fin (most-recent) de l'OrderedDict
+    # Verify it is at the end (most-recent) of the OrderedDict
     last_key = next(reversed(_PAGE_CACHE))
-    assert last_key == (0, "pro", 0)
+    assert last_key == (0, "open", 0)
 
 
 def test_find_leaderboard_channel_returns_lb_channel():
-    """Retourne le canal #leaderboard."""
+    """Returns the #leaderboard channel."""
     from services.leaderboard_refresh import _find_leaderboard_channel
 
     lb = MagicMock()

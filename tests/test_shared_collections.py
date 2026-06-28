@@ -27,9 +27,9 @@ def test_elo_round_trip_via_shared_collection(db):
     target the same collection. This test verifies the round-trip works.
     """
     repository.get_elo_col(db).insert_one(
-        {"_id": "1:pro", "user_id": "1", "queue_type": "pro", "elo": 2500}
+        {"_id": "1:open", "user_id": "1", "queue_type": "open", "elo": 2500}
     )
-    doc = repository.get_elo_col(db).find_one({"_id": "1:pro"})
+    doc = repository.get_elo_col(db).find_one({"_id": "1:open"})
     assert doc is not None
     assert doc["elo"] == 2500
 
@@ -56,7 +56,7 @@ def test_create_match_persists_origin_guild_id(db):
     """create_match writes int(origin_guild_id) to the doc and get_match reads it back."""
     match_id = repository.create_match(
         db,
-        queue_type="pro",
+        queue_type="open",
         origin_guild_id=12345,
         team_a=[{"user_id": "1", "elo": 2000}],
         team_b=[{"user_id": "2", "elo": 2000}],

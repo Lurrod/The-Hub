@@ -1,10 +1,10 @@
-"""VoteView persistante : 2 boutons "Team A/B a gagne".
+"""Persistent VoteView: 2 "Team A/B won" buttons.
 
-Logique :
-- recherche du match par message_id
-- CAS atomique sur status=pending pour eviter votes tardifs et double-validation
-- transition_match_status (CAS) declenche `on_validated` UNIQUEMENT pour le vote
-  qui fait basculer la majorite (pas pour les votes concurrents arrives apres).
+Logic:
+- look up the match by message_id
+- atomic CAS on status=pending to avoid late votes and double-validation
+- transition_match_status (CAS) fires `on_validated` ONLY for the vote
+  that tips the majority (not for concurrent votes arriving afterwards).
 """
 
 from __future__ import annotations
@@ -14,17 +14,15 @@ import logging
 
 import discord
 
-from services import repository
-
 from cogs.match._constants import MAJORITY_THRESHOLD, VOTE_A_BTN_ID, VOTE_B_BTN_ID
 from cogs.match._embeds import build_match_embed_from_doc
-
+from services import repository
 
 logger = logging.getLogger(__name__)
 
 
 class VoteView(discord.ui.View):
-    """View persistante : reporter le vainqueur du match (Team A / Team B)."""
+    """Persistent view: report the winner of the match (Team A / Team B)."""
 
     def __init__(self, db, on_validated=None) -> None:
         super().__init__(timeout=None)
@@ -32,7 +30,7 @@ class VoteView(discord.ui.View):
         self.on_validated = on_validated  # callable(inter, match_doc) -> awaitable
 
     async def _vote(self, inter: discord.Interaction, choice: str) -> None:
-        # 1) Retrouver le match via le message_id
+        # 1) Look up the match via the message_id
         match = await asyncio.to_thread(
             repository.get_match_by_message,
             self.db,
@@ -42,26 +40,26 @@ class VoteView(discord.ui.View):
             await inter.response.send_message("❌ Match introuvable.", ephemeral=True)
             return
 
-        # 2) Match deja valide -> refus
+        # 2) Match already validated -> reject
         if match.get("status") in ("validated_a", "validated_b"):
             await inter.response.send_message(
-                "✅ Ce match est deja valide.",
+                "✅ Ce match est déjà validé.",
                 ephemeral=True,
             )
             return
 
-        # 3) Verifie la participation
+        # 3) Verify participation
         all_player_ids = {str(p["id"]) for p in (match.get("team_a", []) + match.get("team_b", []))}
         if str(inter.user.id) not in all_player_ids:
             await inter.response.send_message(
-                "❌ Tu n'as pas joue ce match, tu ne peux pas voter.",
+                "❌ Tu n'as pas joué ce match, tu ne peux pas voter.",
                 ephemeral=True,
             )
             return
 
-        # 4) Enregistre le vote (ecrase un vote precedent). CAS sur
-        # status=pending : si le match a ete annule/conteste/valide
-        # entre-temps, le vote est rejete proprement.
+        # 4) Record the vote (overwrites a previous vote). CAS on
+        # status=pending: if the match has been cancelled/contested/validated
+        # in the meantime, the vote is rejected cleanly.
         updated = await asyncio.to_thread(
             repository.add_match_vote,
             self.db,
@@ -71,19 +69,19 @@ class VoteView(discord.ui.View):
         )
         if updated is None:
             await inter.response.send_message(
-                "❌ Ce match n'est plus en cours de vote (annule, conteste ou deja valide).",
+                "❌ Ce match n'est plus en phase de vote (annulé, contesté ou déjà validé).",
                 ephemeral=True,
             )
             return
 
-        # 5) Compte
+        # 5) Count
         votes = updated.get("votes", {})
         count_a = sum(1 for v in votes.values() if v == "a")
         count_b = sum(1 for v in votes.values() if v == "b")
 
-        # 6) Majorite atteinte ? Transition atomique (CAS) pour eviter
-        #    qu'un vote concurrent ne valide deux fois et ne declenche
-        #    `on_validated` plusieurs fois.
+        # 6) Majority reached? Atomic transition (CAS) to avoid a
+        #    concurrent vote validating twice and triggering
+        #    `on_validated` multiple times.
         target_status = None
         if count_a >= MAJORITY_THRESHOLD:
             target_status = "validated_a"
@@ -103,8 +101,9 @@ class VoteView(discord.ui.View):
             if transitioned_doc is not None:
                 updated = transitioned_doc
             else:
-                # Un autre vote concurrent a deja valide. On re-fetch pour
-                # afficher l'etat reel sans tirer `on_validated` de notre cote.
+                # Another concurrent vote already validated. We re-fetch
+                # to display the real state without firing `on_validated`
+                # from our side.
                 fetched = await asyncio.to_thread(
                     repository.get_match,
                     self.db,
@@ -112,24 +111,24 @@ class VoteView(discord.ui.View):
                 )
                 updated = fetched or updated
 
-        # 7) Edit du message (embed maj, view retiree si valide)
+        # 7) Edit the message (updated embed, view removed if validated)
         embed = build_match_embed_from_doc(updated, inter.guild.name)
         if updated.get("status") in ("validated_a", "validated_b"):
             await inter.response.edit_message(embed=embed, view=None)
         else:
             await inter.response.edit_message(embed=embed, view=self)
 
-        # 8) Hook Phase 6 : MAJ ELO. Tire UNIQUEMENT si la transition CAS a
-        #    reussi de notre cote (i.e. ce vote-ci est celui qui a fait
-        #    basculer le match).
+        # 8) Phase 6 hook: ELO update. Fires ONLY if the CAS transition
+        #    succeeded on our side (i.e. this vote is the one that
+        #    tipped the match).
         if transitioned_doc is not None and self.on_validated:
             try:
                 await self.on_validated(inter, transitioned_doc)
             except Exception:
-                logger.exception("[vote] on_validated a leve")
+                logger.exception("[vote] on_validated raised")
 
     @discord.ui.button(
-        label="Team A a gagne",
+        label="Team A a gagné",
         style=discord.ButtonStyle.primary,
         custom_id=VOTE_A_BTN_ID,
     )
@@ -137,7 +136,7 @@ class VoteView(discord.ui.View):
         await self._vote(inter, "a")
 
     @discord.ui.button(
-        label="Team B a gagne",
+        label="Team B a gagné",
         style=discord.ButtonStyle.primary,
         custom_id=VOTE_B_BTN_ID,
     )

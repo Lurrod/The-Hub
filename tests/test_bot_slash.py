@@ -1,24 +1,24 @@
 """
-Tests d'integration des SLASH commands et boutons (LeaderboardView).
+Integration tests for SLASH commands and buttons (LeaderboardView).
 
-dpytest ne supporte pas pleinement les slash commands ni les composants.
-On utilise donc des mocks Discord directs : on instancie une fausse
-discord.Interaction, on appelle le callback de la commande, et on verifie
-les appels aux methodes Discord.
+dpytest does not fully support slash commands or components. We use
+direct Discord mocks instead: we build a fake discord.Interaction, call
+the command callback, and assert on the calls to the Discord methods.
 
-Pour lancer :
+To run:
     pytest tests/test_bot_slash.py -v
 """
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
-# Apres refactor : les slash commands sont dans cogs/elo_admin.py et
-# cogs/admin.py. Le bot.add_cog n'est pas appele en tests (pas de
-# setup_hook), donc on instancie le cog manuellement et on re-expose
-# ses commandes sur le module `bot` pour preserver les anciens callsites
-# de test (`bot_module.win.callback(inter, ...)`). La signature `callback`
-# d'une commande dans un cog inclut `self`, donc les appels doivent
-# passer l'instance du cog en 1er argument.
+# After refactor: the slash commands live in cogs/elo_admin.py and
+# cogs/admin.py. bot.add_cog is not called in tests (no setup_hook), so
+# we instantiate the cog manually and re-expose its commands on the
+# `bot` module to preserve the old test call sites
+# (`bot_module.win.callback(inter, ...)`). The `callback` signature of
+# a command in a cog includes `self`, so the calls must pass the cog
+# instance as the 1st argument.
 import bot as _bot_module
 from cogs.admin import AdminCog
 from cogs.elo_admin import ELOAdminCog
@@ -27,8 +27,8 @@ _elo_cog = ELOAdminCog(_bot_module.bot, _bot_module.db)
 _admin_cog = AdminCog(_bot_module.bot, _bot_module.db)
 
 
-# Re-expose les commandes du cog sur le module `bot` (avec auto-bind de
-# `self` via une closure) pour eviter de toucher 13 tests.
+# Re-expose the cog commands on the `bot` module (with auto-bind of
+# `self` via a closure) to avoid touching 13 tests.
 class _BoundCommand:
     def __init__(self, cog, cmd):
         self._cog = cog
@@ -36,7 +36,7 @@ class _BoundCommand:
 
     @property
     def callback(self):
-        # Wrap pour que `.callback(inter, ...)` lie automatiquement self=cog.
+        # Wrap so `.callback(inter, ...)` automatically binds self=cog.
         async def _bound(*args, **kwargs):
             return await self._cmd.callback(self._cog, *args, **kwargs)
 
@@ -52,7 +52,6 @@ for _name in (
     "elomodify",
     "winmodify",
     "losemodify",
-    "stats",
 ):
     setattr(_bot_module, _name, _BoundCommand(_elo_cog, getattr(_elo_cog, _name)))
 for _name in ("map_pick", "coinflip", "clear", "help_cmd", "setup_bot", "bypass"):
@@ -103,21 +102,24 @@ def _fake_interaction(user, guild):
 # ── /stats ────────────────────────────────────────────────────────
 async def test_slash_stats_unknown_player():
     import bot as bot_module
+    from cogs.stats._cog import StatsCog
 
     user = _fake_member(1, "Alice")
     guild = _fake_guild(42, members=[user])
     inter = _fake_interaction(user, guild)
 
-    await bot_module.stats.callback(inter, queue="open", joueur=user)
+    cog = StatsCog(bot_module.bot, bot_module.db)
+    await cog.stats.callback(cog, inter, "open", user)
 
     inter.response.send_message.assert_awaited_once()
     args, kwargs = inter.response.send_message.call_args
-    assert "n'a pas encore joue" in args[0]
+    assert "n'a pas encore joué" in args[0]
     assert kwargs.get("ephemeral") is True
 
 
 async def test_slash_stats_known_player():
     import bot as bot_module
+    from cogs.stats._cog import StatsCog
 
     user = _fake_member(1, "Alice")
     guild = _fake_guild(42, members=[user])
@@ -136,7 +138,8 @@ async def test_slash_stats_known_player():
         }
     )
 
-    await bot_module.stats.callback(inter, queue="open", joueur=user)
+    cog = StatsCog(bot_module.bot, bot_module.db)
+    await cog.stats.callback(cog, inter, "open", user)
 
     inter.response.send_message.assert_awaited_once()
     embed = inter.response.send_message.call_args.kwargs["embed"]
@@ -154,16 +157,16 @@ async def test_slash_win_no_permission():
     guild = _fake_guild(42, members=[user, target])
     inter = _fake_interaction(user, guild)
 
-    await bot_module.win.callback(inter, queue="open", joueur1=target)
+    await bot_module.win.callback(inter, queue="open", player1=target)
 
     inter.response.send_message.assert_awaited_once()
     args, kwargs = inter.response.send_message.call_args
-    assert "Pas la permission" in args[0]
+    assert "n'avez pas la permission" in args[0]
     assert kwargs.get("ephemeral") is True
 
 
 async def test_slash_win_5_players_distributes_elo_v2():
-    """Pondération par position : joueur1→joueur5 = +20, +18, +17, +16, +15."""
+    """Position weighting: player1->player5 = +20, +18, +17, +16, +15."""
     import bot as bot_module
 
     admin = _fake_member(1, "Admin", manage_guild=True)
@@ -174,11 +177,11 @@ async def test_slash_win_5_players_distributes_elo_v2():
     await bot_module.win.callback(
         inter,
         queue="open",
-        joueur1=targets[0],
-        joueur2=targets[1],
-        joueur3=targets[2],
-        joueur4=targets[3],
-        joueur5=targets[4],
+        player1=targets[0],
+        player2=targets[1],
+        player3=targets[2],
+        player4=targets[3],
+        player5=targets[4],
     )
 
     expected_gains = bot_module.WIN_DELTAS_BY_SLOT  # (20, 18, 17, 16, 15)
@@ -188,13 +191,13 @@ async def test_slash_win_5_players_distributes_elo_v2():
         gain = expected_gains[slot]
         expected_elo = 2000 + gain
         assert doc["elo"] == expected_elo, (
-            f"{t.display_name}: attendu {expected_elo}, recu {doc['elo']}"
+            f"{t.display_name}: expected {expected_elo}, got {doc['elo']}"
         )
         assert doc["wins"] == 1
 
 
 async def test_slash_win_base_is_constant_regardless_of_avg():
-    """Le gain par position reste constant quelle que soit l'avg du match."""
+    """Per-position gain stays constant whatever the match avg ELO."""
     import bot as bot_module
 
     admin = _fake_member(1, "Admin", manage_guild=True)
@@ -202,7 +205,7 @@ async def test_slash_win_base_is_constant_regardless_of_avg():
     guild = _fake_guild(42, members=[admin] + targets)
     inter = _fake_interaction(admin, guild)
 
-    # Seed une ELO serveur de 3000 (Radiant) : les gains pondérés sont indépendants de l'avg.
+    # Seed a server ELO of 3000 (Radiant): position-weighted gains are independent of the avg.
     col = bot_module.get_elo_col()
     for t in targets:
         col.insert_one(
@@ -217,13 +220,13 @@ async def test_slash_win_base_is_constant_regardless_of_avg():
             }
         )
 
-    await bot_module.win.callback(inter, queue="open", joueur1=targets[0], joueur2=targets[1])
+    await bot_module.win.callback(inter, queue="open", player1=targets[0], player2=targets[1])
 
     expected_gains = bot_module.WIN_DELTAS_BY_SLOT  # slot 0: +20, slot 1: +18
     for slot, t in enumerate(targets):
         doc = col.find_one({"_id": f"{t.id}:open"})
         expected = 3000 + expected_gains[slot]
-        assert doc["elo"] == expected, f"{t.display_name}: attendu {expected}, recu {doc['elo']}"
+        assert doc["elo"] == expected, f"{t.display_name}: expected {expected}, got {doc['elo']}"
 
 
 # ── /lose ─────────────────────────────────────────────────────────
@@ -260,21 +263,21 @@ async def test_slash_lose_floors_at_zero():
         }
     )
 
-    # /lose pondéré par position : slot 0 -> -10, slot 1 -> -10
+    # /lose weighted by position: slot 0 -> -10, slot 1 -> -10
     # Bob (slot 0)  : max(0, 5 - 10)    = 0
     # Boost (slot 1): 2995 - 10         = 2985
-    await bot_module.lose.callback(inter, queue="open", joueur1=target, joueur2=partner)
+    await bot_module.lose.callback(inter, queue="open", player1=target, player2=partner)
 
     losses = bot_module.LOSE_DELTAS_BY_SLOT
     assert col.find_one({"_id": "2:open"})["elo"] == max(0, 5 - losses[0])
     assert col.find_one({"_id": "3:open"})["elo"] == 2995 - losses[1]
 
 
-# ── /leaderboard + LeaderboardView (le bug initial) ───────────────
+# -- /leaderboard + LeaderboardView (the initial bug) --
 async def test_slash_leaderboard_creates_view_with_pagination():
     """
-    Cas-cle : 30 joueurs -> 2 pages.
-    Verifie que la commande envoie bien un fichier ET une view avec 3 boutons.
+    Key case: 30 players -> 2 pages.
+    Verifies the command sends both a file AND a view with 3 buttons.
     """
     import bot as bot_module
 
@@ -294,32 +297,33 @@ async def test_slash_leaderboard_creates_view_with_pagination():
                 "elo": 100 + i,
                 "wins": i,
                 "losses": 0,
+                "last_played": datetime.now(UTC),
             }
         )
 
     await bot_module.leaderboard.callback(inter, queue="open")
 
-    # La 1ere page passe par interaction.followup.send (apres defer)
+    # The 1st page goes through interaction.followup.send (after defer)
     inter.response.defer.assert_awaited_once()
     inter.followup.send.assert_awaited_once()
 
     kwargs = inter.followup.send.call_args.kwargs
-    assert "file" in kwargs, "Aucun fichier envoye"
-    assert "view" in kwargs, "Aucune view envoyee"
+    assert "file" in kwargs, "No file sent"
+    assert "view" in kwargs, "No view sent"
 
     view = kwargs["view"]
     assert view.page == 0
-    # 3 boutons : prev, page_btn (label), next
+    # 3 buttons: prev, page_btn (label), next
     assert len(view.children) == 3
-    # prev disabled sur page 0, next active
+    # prev disabled on page 0, next active
     assert view.children[0].disabled is True
     assert view.children[2].disabled is False
 
 
 async def test_slash_leaderboard_next_button_navigates_to_page_2():
     """
-    LE TEST DU BUG : on simule un clic sur le bouton next et on verifie
-    que la page change et qu'un nouveau fichier est envoye.
+    THE BUG TEST: we simulate a click on the next button and verify the
+    page changes and a new file is sent.
     """
     import bot as bot_module
 
@@ -339,20 +343,21 @@ async def test_slash_leaderboard_next_button_navigates_to_page_2():
                 "elo": 100 + i,
                 "wins": 0,
                 "losses": 0,
+                "last_played": datetime.now(UTC),
             }
         )
 
-    # 1) Lance la commande pour obtenir la view
+    # 1) Run the command to get the view
     await bot_module.leaderboard.callback(inter, queue="open")
     view = inter.followup.send.call_args.kwargs["view"]
     assert view.page == 0
 
-    # 2) Simule un clic sur "next" : on appelle directement le helper _go
+    # 2) Simulate a "next" click: directly call the _go helper
     btn_inter = _fake_interaction(admin, guild)
     await view._go(btn_inter, view.page + 1)
 
-    # 3) Verifie : page = 1, defer + edit appeles
-    assert view.page == 1, f"La page n'a pas change : {view.page}"
+    # 3) Verify: page = 1, defer + edit called
+    assert view.page == 1, f"Page did not change: {view.page}"
     btn_inter.response.defer.assert_awaited_once()
     btn_inter.followup.edit_message.assert_awaited_once()
 
@@ -361,17 +366,17 @@ async def test_slash_leaderboard_next_button_navigates_to_page_2():
     assert "attachments" in edit_kwargs and len(edit_kwargs["attachments"]) == 1
     assert "view" in edit_kwargs
 
-    # 4) Boutons mis a jour : sur page 1 (=derniere), next desactive, prev actif
+    # 4) Buttons updated: on page 1 (=last), next disabled, prev active
     assert view.children[0].disabled is False  # prev
     assert view.children[2].disabled is True  # next
 
 
 async def test_slash_leaderboard_clicking_next_past_last_page_is_noop():
-    """Garde de bornes : aller au-dela de la derniere page ne casse rien."""
+    """Bounds guard: going past the last page does not break anything."""
     import bot as bot_module
 
     admin = _fake_member(1, "Admin", manage_guild=True)
-    # 16 joueurs -> 2 pages (page 0 et page 1)
+    # 16 players -> 2 pages (page 0 and page 1)
     members = [_fake_member(100 + i, f"User{i}") for i in range(16)]
     guild = _fake_guild(42, members=[admin] + members)
     inter = _fake_interaction(admin, guild)
@@ -387,21 +392,22 @@ async def test_slash_leaderboard_clicking_next_past_last_page_is_noop():
                 "elo": 100 + i,
                 "wins": 0,
                 "losses": 0,
+                "last_played": datetime.now(UTC),
             }
         )
 
     await bot_module.leaderboard.callback(inter, queue="open")
     view = inter.followup.send.call_args.kwargs["view"]
 
-    # Aller en page 1 (derniere)
+    # Go to page 1 (last)
     btn_inter = _fake_interaction(admin, guild)
     await view._go(btn_inter, 1)
     assert view.page == 1
 
-    # Tenter d'aller en page 2 (out of bounds) : la page ne change pas
+    # Try to go to page 2 (out of bounds): page does not change
     btn_inter2 = _fake_interaction(admin, guild)
     await view._go(btn_inter2, 2)
-    assert view.page == 1, "La page ne doit PAS changer quand on depasse total_pages"
+    assert view.page == 1, "Page must NOT change when going past total_pages"
     btn_inter2.followup.edit_message.assert_not_awaited()
 
 
@@ -414,9 +420,7 @@ async def test_slash_elomodify_add():
     guild = _fake_guild(42, members=[admin, target])
     inter = _fake_interaction(admin, guild)
 
-    await bot_module.elomodify.callback(
-        inter, queue="open", joueur=target, action="add", montant=50
-    )
+    await bot_module.elomodify.callback(inter, queue="open", player=target, action="add", amount=50)
 
     col = bot_module.get_elo_col()
     doc = col.find_one({"_id": "2:open"})
@@ -445,7 +449,7 @@ async def test_slash_elomodify_remove_floors_at_zero():
     )
 
     await bot_module.elomodify.callback(
-        inter, queue="open", joueur=target, action="remove", montant=100
+        inter, queue="open", player=target, action="remove", amount=100
     )
 
     doc = col.find_one({"_id": "2:open"})
@@ -474,7 +478,7 @@ async def test_slash_resetelo_single_player():
         }
     )
 
-    await bot_module.resetelo.callback(inter, queue="open", joueur=target, all_players=False)
+    await bot_module.resetelo.callback(inter, queue="open", player=target, all_players=False)
 
     doc = col.find_one({"_id": "2:open"})
     assert doc["elo"] == bot_module.ELO_START
@@ -504,7 +508,7 @@ async def test_slash_resetelo_all_players():
             }
         )
 
-    await bot_module.resetelo.callback(inter, queue="open", joueur=None, all_players=True)
+    await bot_module.resetelo.callback(inter, queue="open", player=None, all_players=True)
 
     for t in targets:
         doc = col.find_one({"_id": f"{t.id}:open"})
@@ -524,9 +528,9 @@ async def test_slash_map_returns_known_map():
 
     inter.response.send_message.assert_awaited_once()
     embed = inter.response.send_message.call_args.kwargs["embed"]
-    # Le titre contient le nom de la map
+    # The title contains the map name
     assert any(m in embed.description for m in bot_module.MAPS), (
-        f"Map non reconnue : {embed.description}"
+        f"Map not recognized: {embed.description}"
     )
 
 
@@ -586,14 +590,14 @@ async def test_slash_setup_creates_category_and_channels():
     guild = _fake_guild_with_setup(42)
     inter = _fake_interaction(admin, guild)
 
-    # bot.get_cog renvoie None ici (pas de cog charge en test)
+    # bot.get_cog returns None here (no cog loaded in tests)
     bot_module.bot.get_cog = MagicMock(return_value=None)
 
     await bot_module.setup_bot.callback(inter)
 
-    # Categorie creee
+    # Category created
     assert any(c.name == SETUP_CATEGORY_NAME for c in guild.categories)
-    # Tous les salons crees
+    # All channels created
     names = [c.name for c in guild.text_channels]
     for expected in SETUP_CHANNELS:
         assert expected in names
@@ -611,7 +615,7 @@ async def test_slash_setup_idempotent_when_channels_exist():
     admin = _fake_member(1, "Admin", manage_guild=True)
     guild = _fake_guild_with_setup(42)
 
-    # Pre-cree categorie + salons
+    # Pre-create category + channels
     cat = MagicMock()
     cat.name = SETUP_CATEGORY_NAME
     guild.categories.append(cat)
@@ -628,7 +632,7 @@ async def test_slash_setup_idempotent_when_channels_exist():
 
     await bot_module.setup_bot.callback(inter)
 
-    # Aucune creation
+    # No creation
     guild.create_category.assert_not_awaited()
     guild.create_text_channel.assert_not_awaited()
 

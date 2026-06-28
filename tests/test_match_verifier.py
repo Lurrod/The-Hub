@@ -1,12 +1,12 @@
 """
-Tests du module services/match_verifier.py.
+Tests for the services/match_verifier.py module.
 
-Couvre :
-  - `find_henrik_custom_match` : recherche d'un match custom recent
-    contenant les 10 puuids attendus.
-  - `compute_acs_multipliers` : calcul des multiplicateurs ACS par
-    joueur, clampes a [0.7, 1.3], avec gestion des cas degeneres
-    (teams mixtes, tie, avg_acs=0).
+Covers:
+  - `find_henrik_custom_match`: lookup of a recent custom match
+    containing the 10 expected puuids.
+  - `compute_acs_multipliers`: per-player ACS multiplier computation,
+    clamped to [0.7, 1.3], with handling of degenerate cases
+    (mixed teams, tie, avg_acs=0).
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def test_find_custom_returns_match_when_puuids_match():
 def test_find_custom_skips_non_custom_mode():
     started = datetime.now(UTC)
     expected = {"a", "b"}
-    # Mode "Competitive" mais contient les bons puuids
+    # Mode "Competitive" but contains the right puuids
     wrong_mode = _summary(
         matchid="M_COMP",
         mode="Competitive",
@@ -132,8 +132,8 @@ def test_find_custom_skips_matches_before_after():
 
 def test_find_custom_skips_when_puuids_incomplete():
     started = datetime.now(UTC)
-    expected = {"a", "b", "c"}  # 3 attendus
-    # Le match n'a que 2 des 3 puuids
+    expected = {"a", "b", "c"}  # 3 expected
+    # The match only has 2 of the 3 puuids
     partial = _summary(
         matchid="M_PARTIAL",
         started_at=started,
@@ -169,8 +169,8 @@ def test_find_custom_returns_none_on_riot_error():
 
 
 def test_find_custom_returns_first_matching_in_history():
-    """Le client renvoie l'historique du plus recent au plus ancien.
-    On doit prendre le premier qui matche, pas le dernier."""
+    """The client returns the history from most recent to oldest. We must
+    take the first one that matches, not the last."""
     started = datetime.now(UTC)
     expected = {"a", "b"}
     newer = _summary(
@@ -200,7 +200,7 @@ def test_find_custom_returns_first_matching_in_history():
 
 # ── compute_acs_multipliers ───────────────────────────────────────
 def test_acs_happy_path_team_a_wins():
-    """Team A (Red) gagne 13-11 ; tous les joueurs ont meme score = mult ~1.0"""
+    """Team A (Red) wins 13-11; all players have the same score = mult ~1.0."""
     players = (
         # 5 sur Red (Team A)
         _stats("a1", "Red", score=2400),
@@ -222,10 +222,10 @@ def test_acs_happy_path_team_a_wins():
     result = compute_acs_multipliers(match, team_a_uid_by_puuid=team_a, team_b_uid_by_puuid=team_b)
     assert result.winning_team == "Red"
     assert len(result.performances) == 10
-    # Tous mults = 1.0 puisque acs egal a avg_acs
+    # All mults = 1.0 since acs equals avg_acs
     for p in result.performances:
         assert p.multiplier == pytest.approx(1.0, abs=0.01)
-    # Team A (Red) gagne
+    # Team A (Red) wins
     team_a_perfs = [p for p in result.performances if p.user_id.startswith("uid_a")]
     assert all(p.win for p in team_a_perfs)
     team_b_perfs = [p for p in result.performances if p.user_id.startswith("uid_b")]
@@ -233,7 +233,7 @@ def test_acs_happy_path_team_a_wins():
 
 
 def test_acs_top_frag_gets_higher_multiplier():
-    """Un joueur avec ACS double doit avoir un mult plus haut (clampe a 1.3)."""
+    """A player with double ACS must have a higher mult (clamped to 1.3)."""
     players = (
         _stats("a1", "Red", score=4800),  # top frag : 2x la moyenne
         _stats("a2", "Red", score=2400),
@@ -252,11 +252,11 @@ def test_acs_top_frag_gets_higher_multiplier():
 
     result = compute_acs_multipliers(match, team_a_uid_by_puuid=team_a, team_b_uid_by_puuid=team_b)
     top = next(p for p in result.performances if p.user_id == "uid_a1")
-    assert top.multiplier == DEFAULT_MULT_MAX  # clampe a 1.3
+    assert top.multiplier == DEFAULT_MULT_MAX  # clamped to 1.3
 
 
 def test_acs_bottom_frag_clamped_to_min():
-    """Un joueur avec ACS quasi-nul doit etre clampe a 0.7."""
+    """A player with near-zero ACS must be clamped to 0.7."""
     players = (
         _stats("a1", "Red", score=0),  # bottom frag
         _stats("a2", "Red", score=3000),
@@ -275,17 +275,17 @@ def test_acs_bottom_frag_clamped_to_min():
 
     result = compute_acs_multipliers(match, team_a_uid_by_puuid=team_a, team_b_uid_by_puuid=team_b)
     bottom = next(p for p in result.performances if p.user_id == "uid_a1")
-    assert bottom.multiplier == DEFAULT_MULT_MIN  # clampe a 0.7
+    assert bottom.multiplier == DEFAULT_MULT_MIN  # clamped to 0.7
 
 
 def test_acs_mixed_team_labels_skipped():
-    """Si les joueurs Team A du bot sont eparpilles entre Red et Blue cote
-    Henrik (lobby ou les joueurs ont switche A/D), on skip cette equipe."""
+    """If the bot's Team A players are spread between Red and Blue on the
+    Henrik side (lobby where players switched A/D), we skip that team."""
     players = (
         _stats("a1", "Red", score=2400),  # 3 Red
         _stats("a2", "Red", score=2400),
         _stats("a3", "Red", score=2400),
-        _stats("a4", "Blue", score=2400),  # mais 2 Blue !
+        _stats("a4", "Blue", score=2400),  # but 2 Blue!
         _stats("a5", "Blue", score=2400),
         _stats("b1", "Blue", score=2400),
         _stats("b2", "Blue", score=2400),
@@ -298,12 +298,12 @@ def test_acs_mixed_team_labels_skipped():
     team_b = {f"b{i}": f"uid_b{i}" for i in range(1, 6)}
 
     result = compute_acs_multipliers(match, team_a_uid_by_puuid=team_a, team_b_uid_by_puuid=team_b)
-    # Aucune perf calculee car les deux teams sont mixtes
+    # No perf computed because both teams are mixed
     assert len(result.performances) == 0
 
 
 def test_acs_handles_tie_with_empty_winning_team():
-    """Si les 2 teams ont le meme nombre de rounds, winning_team = ''."""
+    """If both teams have the same round count, winning_team = ''."""
     players = (
         _stats("a1", "Red", score=2400),
         _stats("b1", "Blue", score=2400),
@@ -314,13 +314,13 @@ def test_acs_handles_tie_with_empty_winning_team():
 
     result = compute_acs_multipliers(match, team_a_uid_by_puuid=team_a, team_b_uid_by_puuid=team_b)
     assert result.winning_team == ""
-    # Personne ne gagne
+    # Nobody wins
     for p in result.performances:
         assert p.win is False
 
 
 def test_acs_zero_avg_falls_back_to_one():
-    """Si toute l'equipe a un score de 0 (avg=0), pas de division par zero."""
+    """If the whole team has a score of 0 (avg=0), no division by zero."""
     players = (
         _stats("a1", "Red", score=0),
         _stats("a2", "Red", score=0),
@@ -336,11 +336,11 @@ def test_acs_zero_avg_falls_back_to_one():
     team_a_perfs = [p for p in result.performances if p.user_id.startswith("uid_a")]
     assert len(team_a_perfs) == 2
     for p in team_a_perfs:
-        assert p.multiplier == DEFAULT_MULT_MIN  # clampe a 0.7
+        assert p.multiplier == DEFAULT_MULT_MIN  # clamped to 0.7
 
 
 def test_acs_team_b_wins_correctly_labeled():
-    """Quand Blue gagne, les joueurs Blue sont marques win=True."""
+    """When Blue wins, Blue players are marked win=True."""
     players = (
         _stats("a1", "Red", score=2400),
         _stats("a2", "Red", score=2400),

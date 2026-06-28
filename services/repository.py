@@ -1,22 +1,28 @@
-"""Acces MongoDB centralise. Toutes les collections passent par ici."""
+"""Centralized MongoDB access. All collections go through here."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
 from pymongo import ReturnDocument
 from pymongo.collection import Collection
 from pymongo.database import Database
-from datetime import UTC, datetime
 
 logger = logging.getLogger(__name__)
 
 
-# Tuple ordonne des queue types supportes. L'ordre influence l'affichage
-# (boucles de pre-post leaderboards, /setup) : Pro en premier, GC en dernier.
-QUEUE_TYPES: tuple[str, ...] = ("pro", "open", "gc")
+# Ordered tuple of supported queue types. Order drives display
+# (/setup, queue views): Open first, then Advanced, then Draft.
+QUEUE_TYPES: tuple[str, ...] = ("open", "advanced", "draft")
+
+# Queues that carry ELO + a leaderboard. "draft" is intentionally
+# excluded: it only forms teams and posts the end-of-game scoreboard,
+# without points or a ranking.
+RANKED_QUEUE_TYPES: tuple[str, ...] = ("open", "advanced")
 
 
 def is_valid_queue_type(queue_type: str) -> bool:
@@ -25,84 +31,91 @@ def is_valid_queue_type(queue_type: str) -> bool:
 
 def _check_queue_type(queue_type: str) -> None:
     if not is_valid_queue_type(queue_type):
-        raise ValueError(f"queue_type invalide : {queue_type!r}. Attendus : {QUEUE_TYPES}")
+        raise ValueError(f"invalid queue_type: {queue_type!r}. Expected: {QUEUE_TYPES}")
 
 
-# Les signatures de ce module acceptent `int | str` pour les IDs Discord
-# (user_id, guild_id, channel_id, role_id, message_id, category_id) parce
-# que :
-#   - Discord.py fournit des int (`member.id`, `guild.id`, ...).
-#   - Certains docs Mongo historiques stockent l'ID en str ; on les relit
-#     tel quel et on les repasse au repo sans cast.
-# Le risque concret : un appelant passe par erreur `member.name` au lieu
-# de `member.id` -> `int("Bob")` leve un `ValueError` sec. Ce helper
-# garde la coercion centrale et donne un message qui pointe le champ et
-# la valeur fautive.
+# This module's signatures accept `int | str` for Discord IDs
+# (user_id, guild_id, channel_id, role_id, message_id, category_id) because:
+#   - Discord.py provides ints (`member.id`, `guild.id`, ...).
+#   - Some legacy Mongo docs store the ID as str; we read them as-is and
+#     pass them back to the repo without a cast.
+# Concrete risk: a caller passes `member.name` by mistake instead of
+# `member.id` -> `int("Bob")` raises a bare `ValueError`. This helper
+# keeps the coercion centralized and gives a message that points to the
+# field and the offending value.
 def _to_int_id(value: int | str, *, field: str = "id") -> int:
     try:
         return int(value)
     except (TypeError, ValueError) as exc:
-        raise TypeError(f"{field}: attendu int ou str numerique, recu {value!r}") from exc
+        raise TypeError(f"{field}: expected int or numeric str, received {value!r}") from exc
 
 
 def player_doc_id(user_id: int | str, queue_type: str) -> str:
-    """Compound _id pour un doc joueur dans la collection partagée `elo`."""
+    """Compound _id for a player doc in the shared `elo` collection."""
     _check_queue_type(queue_type)
     return f"{user_id}:{queue_type}"
 
 
 def active_queue_id(queue_type: str) -> str:
-    """_id pour la queue active d'un type donne dans queue_<guild>."""
+    """_id for the active queue of a given type in queue_<guild>."""
     _check_queue_type(queue_type)
     return f"active:{queue_type}"
 
 
 def leaderboard_state_id(queue_type: str) -> str:
-    """_id pour le state du leaderboard d'un type dans leaderboard_state_<guild>."""
+    """_id for the leaderboard state of a type in leaderboard_state_<guild>."""
     _check_queue_type(queue_type)
     return f"current:{queue_type}"
 
 
-# Cache des collections deja indexees pour eviter de re-issuer create_index a
-# chaque call (idempotent cote Mongo, mais inutile en perf).
+# Cache of already-indexed collections to avoid re-issuing create_index on
+# every call (idempotent on the Mongo side, but useless perf-wise).
 _indexed_collections: set[str] = set()
 
 
 def _ensure_indexes(col, kind: str) -> None:
-    """Cree les indexes manquants sur une collection. Idempotent et safe en
-    cas d'echec (ex: mongomock partial support, perms manquantes)."""
+    """Create missing indexes on a collection. Idempotent and safe on
+    failure (e.g. mongomock partial support, missing perms)."""
     name = col.full_name if hasattr(col, "full_name") else f"{kind}:{id(col)}"
     if name in _indexed_collections:
         return
     try:
         if kind == "elo":
-            # Tri leaderboard par ELO desc.
+            # Leaderboard sort by ELO desc.
             col.create_index([("elo", -1)])
         elif kind == "matches":
-            # Lookup vote message + scan timeout + scan verification ELO.
+            # Vote message lookup + timeout scan + ELO verification scan.
             col.create_index([("message_id", 1)])
             col.create_index([("status", 1), ("created_at", 1)])
             col.create_index([("status", 1), ("validated_at", 1), ("elo_applied", 1)])
         elif kind == "riot":
-            # Dedup PUUID : empeche un meme compte Riot d'etre lie a 2
-            # comptes Discord (multi-account farming du seed ELO).
+            # PUUID dedup: prevents the same Riot account from being linked
+            # to 2 Discord accounts (multi-account farming of the ELO seed).
             col.create_index([("puuid", 1)], unique=True, sparse=True)
         elif kind == "rules":
-            # Acces uniquement par _id (user_id), indexe d'office par
-            # MongoDB. Aucun index applicatif a creer : branche explicite
-            # pour lever l'ambiguite (sinon "rules" tombe dans le no-op
-            # silencieux du if/elif et un futur dev croirait l'oubli).
+            # Accessed only by _id (user_id), indexed by MongoDB by default.
+            # No application-level index to create: explicit branch to
+            # remove ambiguity (otherwise "rules" would fall into the
+            # silent no-op of the if/elif and a future dev might think it
+            # was forgotten).
+            pass
+        elif kind == "match_player_stats":
+            # Leaderboard queries: lookup by user/queue/date, sorted by date desc.
+            col.create_index([("user_id", 1), ("queue_type", 1), ("created_at", -1)])
+        elif kind == "player_rating_aggregates":
+            # PK lookups only; no secondary index needed.
             pass
     except Exception as e:
-        logger.error(f"[repository] _ensure_indexes({kind}) a leve : {e}", exc_info=True)
+        logger.error(f"[repository] _ensure_indexes({kind}) raised: {e}", exc_info=True)
     _indexed_collections.add(name)
 
 
 def get_elo_col(db: Database) -> Collection:
-    """Collection ELO partagée entre toutes les guilds.
+    """ELO collection shared across all guilds.
 
-    Le doc `_id` reste compound `<user_id>:<queue_type>`. Tous les bots utilisant
-    la même MongoDB lisent/écrivent ici, peu importe la guild Discord d'origine.
+    The `_id` doc stays compound `<user_id>:<queue_type>`. All bots using
+    the same MongoDB read/write here, regardless of the originating
+    Discord guild.
     """
     col = db["elo"]
     _ensure_indexes(col, "elo")
@@ -133,11 +146,11 @@ def get_or_create_player(
     display_name: str,
     initial_elo: int = 2000,
 ) -> Mapping[str, Any]:
-    """Recupere ou cree atomiquement le doc joueur d'une queue.
+    """Atomically get or create a player's queue doc.
 
-    Le `_id` est `<user_id>:<queue_type>` (compound). Le champ `queue_type`
-    est aussi persiste pour permettre les filtres par type (leaderboard,
-    /reset-queue) sans regex sur _id."""
+    The `_id` is `<user_id>:<queue_type>` (compound). The `queue_type`
+    field is also persisted to allow filters by type (leaderboard,
+    /reset-queue) without a regex on _id."""
     _check_queue_type(queue_type)
     doc_id = player_doc_id(user_id, queue_type)
     return col.find_one_and_update(
@@ -157,9 +170,9 @@ def get_or_create_player(
     )
 
 
-# ── V2 : comptes Riot lies ───────────────────────────────────────
+# -- V2: linked Riot accounts --------------------------------------
 def get_riot_col(db: Database) -> Collection:
-    """Collection riot link partagée entre toutes les guilds."""
+    """Riot link collection shared across all guilds."""
     col = db["riot"]
     _ensure_indexes(col, "riot")
     return col
@@ -169,10 +182,10 @@ def find_riot_account_by_puuid(
     db: Database,
     puuid: str,
 ) -> Mapping[str, Any] | None:
-    """Renvoie le doc riot_account ayant ce puuid, ou None.
+    """Returns the riot_account doc with this puuid, or None.
 
-    Utilise pour la dedup PUUID dans /link-riot : empeche un meme compte
-    Riot d'etre lie a deux comptes Discord differents (multi-account)."""
+    Used for PUUID dedup in /link-riot: prevents the same Riot account
+    from being linked to two different Discord accounts (multi-account)."""
     if not puuid:
         return None
     return get_riot_col(db).find_one({"puuid": puuid})
@@ -189,11 +202,11 @@ def link_riot_account(
     peak_elo: int,
     source: str,
 ) -> None:
-    """Enregistre ou met a jour le lien Discord <-> Riot (metadata uniquement).
+    """Record or update the Discord <-> Riot link (metadata only).
 
-    L'ELO de matchmaking est stockee dans la collection partagee `elo` ; ce doc
-    ne sert plus qu'a (a) verifier qu'un joueur est lie pour rejoindre la queue,
-    (b) afficher le rang Riot de reference.
+    The matchmaking ELO is stored in the shared `elo` collection; this
+    doc is now only used to (a) verify that a player is linked to join
+    the queue, (b) display the reference Riot rank.
     """
     from datetime import datetime
 
@@ -219,30 +232,30 @@ def get_riot_account(db: Database, user_id: int | str) -> Mapping[str, Any] | No
 
 
 def unlink_riot_account(db: Database, user_id: int | str) -> bool:
-    """Renvoie True si une entree a ete supprimee."""
+    """Returns True if an entry was deleted."""
     res = get_riot_col(db).delete_one({"_id": str(user_id)})
     return res.deleted_count > 0
 
 
-# ── Reglement (acceptation du reglement) ──────────────────────────
+# -- Rules (rules acceptance) --------------------------------------
 def get_rules_col(db: Database) -> Collection:
-    """Collection globale d'acceptation du reglement (clé = user_id).
+    """Global rules acceptance collection (key = user_id).
 
-    Acceptation par joueur (pas par guild ni par queue), valable une fois
-    pour toutes."""
+    Acceptance is per player (not per guild or queue), valid once and
+    for all."""
     col = db["rules"]
     _ensure_indexes(col, "rules")
     return col
 
 
 def has_accepted_rules(db: Database, user_id: int | str) -> bool:
-    """True si le joueur a deja accepte le reglement."""
+    """True if the player has already accepted the rules."""
     return get_rules_col(db).find_one({"_id": str(user_id)}) is not None
 
 
 def record_rules_acceptance(db: Database, user_id: int | str, *, display_name: str) -> None:
-    """Enregistre (ou met a jour) l'acceptation du reglement. Idempotent :
-    un re-clic reecrit simplement accepted_at."""
+    """Record (or update) the rules acceptance. Idempotent:
+    a re-click simply rewrites accepted_at."""
     get_rules_col(db).update_one(
         {"_id": str(user_id)},
         {"$set": {"accepted_at": datetime.now(UTC), "display_name": display_name}},
@@ -250,7 +263,7 @@ def record_rules_acceptance(db: Database, user_id: int | str, *, display_name: s
     )
 
 
-# ── V2 : queue 10mans ─────────────────────────────────────────────
+# -- V2: 10-mans queue ---------------------------------------------
 QUEUE_SIZE_DEFAULT = 10
 
 
@@ -272,7 +285,7 @@ def setup_active_queue(
     channel_id: int,
     message_id: int,
 ) -> None:
-    """Cree (ou remplace) la queue active de ce type pour ce guild."""
+    """Create (or replace) the active queue of this type for this guild."""
     _check_queue_type(queue_type)
     from datetime import datetime
 
@@ -303,10 +316,10 @@ def close_active_queue(
     guild_id: int | str,
     queue_type: str,
 ) -> Mapping[str, Any] | None:
-    """Marque la queue de ce type comme 'forming' et renvoie le doc mis a jour.
+    """Mark the queue of this type as 'forming' and return the updated doc.
 
-    Renvoie None si la queue n'existe pas. Utilise find_one_and_update pour
-    fusionner write + read en un seul round-trip atomique.
+    Returns None if the queue does not exist. Uses find_one_and_update to
+    merge write + read into a single atomic round-trip.
     """
     _check_queue_type(queue_type)
     return get_queue_col(db, guild_id).find_one_and_update(
@@ -393,7 +406,7 @@ def find_player_in_any_queue(
     guild_id: int | str,
     user_id: int | str,
 ) -> str | None:
-    """Renvoie le queue_type ou le user est present, ou None."""
+    """Returns the queue_type where the user is present, or None."""
     uid_str = str(user_id)
     col = get_queue_col(db, guild_id)
     for qt in QUEUE_TYPES:
@@ -403,15 +416,118 @@ def find_player_in_any_queue(
     return None
 
 
-# ── V2 : matches ──────────────────────────────────────────────────
+# -- V2: matches ---------------------------------------------------
 def get_matches_col(db: Database) -> Collection:
-    """Collection matches partagée entre toutes les guilds.
+    """Matches collection shared across all guilds.
 
-    Chaque match porte un champ `origin_guild_id` pour la traçabilité
-    (présent uniquement sur les matches créés après le refactor)."""
+    Each match carries an `origin_guild_id` field for traceability
+    (present only on matches created after the refactor)."""
     col = db["matches"]
     _ensure_indexes(col, "matches")
     return col
+
+
+def create_preparing_match(
+    db: Database,
+    *,
+    queue_type: str,
+    origin_guild_id: int,
+    match_number: int,
+    category_id: int,
+    channel_id: int,
+    player_ids: list[int],
+) -> Any:
+    """Insert a placeholder match doc with status='preparing'.
+
+    Persisted BEFORE captain draft / map ban so that:
+    - the match category is recognized at startup (not auto-deleted as
+      an orphan)
+    - `/match-cancel` and admin commands can resolve the match by
+      channel_id even while the in-memory draft/ban session is running
+    - if the bot restarts mid-draft/ban, startup recovery can detect
+      these stuck matches and clean them up.
+
+    `finalize_preparing_match` later promotes preparing -> pending once
+    the teams and map are known.
+    """
+    _check_queue_type(queue_type)
+    from datetime import datetime
+
+    doc: dict[str, Any] = {
+        "status": "preparing",
+        "queue_type": queue_type,
+        "origin_guild_id": _to_int_id(origin_guild_id, field="origin_guild_id"),
+        "match_number": int(match_number),
+        "category_id": _to_int_id(category_id, field="category_id"),
+        "channel_id": _to_int_id(channel_id, field="channel_id"),
+        "player_ids": [int(p) for p in player_ids],
+        "created_at": datetime.now(UTC),
+        "votes": {},
+        "message_id": None,
+        "team_a": None,
+        "team_b": None,
+        "map": None,
+        "lobby_leader_id": None,
+        "category_name": None,
+        "validated_at": None,
+    }
+    res = get_matches_col(db).insert_one(doc)
+    return res.inserted_id
+
+
+def finalize_preparing_match(
+    db: Database,
+    match_id: Any,
+    *,
+    team_a: list[dict],
+    team_b: list[dict],
+    map_name: str,
+    lobby_leader_id: int | str,
+    category_name: str | None,
+    team_a_side: str | None = None,
+) -> None:
+    """Promote a 'preparing' match to 'pending' once teams + map are
+    known. No-op if the doc is no longer in 'preparing' state (e.g.
+    admin cancelled it during draft/ban)."""
+    from datetime import datetime
+
+    get_matches_col(db).update_one(
+        {"_id": match_id, "status": "preparing"},
+        {
+            "$set": {
+                "status": "pending",
+                "team_a": team_a,
+                "team_b": team_b,
+                "map": map_name,
+                "team_a_side": team_a_side,
+                "lobby_leader_id": str(lobby_leader_id),
+                "category_name": category_name,
+                "promoted_at": datetime.now(UTC),
+            }
+        },
+    )
+
+
+def cancel_preparing_match(db: Database, match_id: Any) -> Mapping[str, Any] | None:
+    """Atomically transition preparing -> cancelled. Used by draft/ban
+    cancel paths and by the startup recovery sweep. Returns the doc
+    BEFORE the update, or None if it was no longer preparing."""
+    return get_matches_col(db).find_one_and_update(
+        {"_id": match_id, "status": "preparing"},
+        {"$set": {"status": "cancelled"}},
+        return_document=ReturnDocument.BEFORE,
+    )
+
+
+def find_preparing_matches(
+    db: Database, *, origin_guild_id: int | None = None
+) -> list[Mapping[str, Any]]:
+    """Return all matches stuck in 'preparing' state. Used by startup
+    recovery to find drafts/map-bans interrupted by a bot restart."""
+    query: dict[str, Any] = {"status": "preparing"}
+    if origin_guild_id is not None:
+        query["origin_guild_id"] = _to_int_id(origin_guild_id, field="origin_guild_id")
+    return list(get_matches_col(db).find(query))
 
 
 def create_match(
@@ -429,14 +545,14 @@ def create_match(
     message_id: int | None,
     channel_id: int | None,
 ) -> Any:
-    """Insere un nouveau match. Renvoie son _id (ObjectId).
+    """Insert a new match. Returns its _id (ObjectId).
 
-    `queue_type` (kw-only) : "pro" | "open" | "gc". Persiste sur le doc
-    pour permettre les filtres par type (leaderboard refresh, /reset-queue,
+    `queue_type` (kw-only): "pro" | "semipro" | "open" | "gc". Persisted on
+    the doc to allow filters by type (leaderboard refresh, /reset-queue,
     Pro Queue Henrik skip).
 
-    `origin_guild_id` (kw-only) : guild Discord d'origine du match, pour
-    la traçabilité cross-guild (la collection `matches` est partagée)."""
+    `origin_guild_id` (kw-only): originating Discord guild of the match,
+    for cross-guild traceability (the `matches` collection is shared)."""
     _check_queue_type(queue_type)
     from datetime import datetime
 
@@ -471,18 +587,18 @@ def get_match_by_message(db: Database, message_id: int) -> Mapping[str, Any] | N
     return get_matches_col(db).find_one({"message_id": _to_int_id(message_id, field="message_id")})
 
 
-# Statuts pour lesquels un joueur est considere encore engage dans un match.
-# Sert au gate anti-doublon de la queue : un joueur deja dans un de ces
-# matchs ne peut pas rejoindre une nouvelle queue.
-#   - "pending"      : vote ouvert, match pas encore conclu
-#   - "contested"    : timeout vote, en attente de resolution admin
+# Statuses for which a player is considered still engaged in a match.
+# Used for the queue anti-duplicate gate: a player already in one of these
+# matches cannot join a new queue.
+#   - "pending"      : vote open, match not yet concluded
+#   - "contested"    : vote timed out, awaiting admin resolution
 #
-# Les statuts "validated_a" / "validated_b" sont volontairement EXCLUS du
-# gate : une fois le vote tranche, le match est logiquement clos. Bloquer
-# la queue sur "elo_applied != True" laisse toute defaillance Henrik
-# (tracker prive, mauvais compte joue, API down) figer les 10 joueurs
-# indefiniment. La distribution ELO est un job async independant du gate ;
-# _verify_match + le filet expire_stale_contested font le reste.
+# The "validated_a" / "validated_b" statuses are intentionally EXCLUDED
+# from the gate: once the vote is resolved, the match is logically closed.
+# Blocking the queue on "elo_applied != True" would let any Henrik failure
+# (private tracker, wrong account played, API down) freeze the 10 players
+# indefinitely. ELO distribution is an async job independent of the gate;
+# _verify_match + the expire_stale_contested safety net do the rest.
 _ACTIVE_MATCH_STATUSES_FOR_QUEUE_GATE: tuple[str, ...] = (
     "pending",
     "contested",
@@ -490,11 +606,11 @@ _ACTIVE_MATCH_STATUSES_FOR_QUEUE_GATE: tuple[str, ...] = (
 
 
 def find_active_match_for_player(db: Database, user_id: int | str) -> Mapping[str, Any] | None:
-    """Renvoie le match actif (statut non-terminal, ELO non applique) auquel
-    `user_id` appartient, ou None.
+    """Returns the active match (non-terminal status, ELO not applied) the
+    `user_id` belongs to, or None.
 
-    Utilise par la queue pour refuser le rejoin tant que le joueur n'a pas
-    cloture son match en cours (vote ou /match-cancel admin)."""
+    Used by the queue to refuse rejoining until the player has closed
+    their ongoing match (vote or admin /match-cancel)."""
     uid_int = _to_int_id(user_id, field="user_id")
     return get_matches_col(db).find_one(
         {
@@ -512,16 +628,16 @@ def expire_stale_contested(
     origin_guild_id: int | str,
     cutoff_dt,
 ) -> int:
-    """Filet de securite : transitionne `contested` -> `cleaned_up` pour
-    tout match cree avant `cutoff_dt`.
+    """Safety net: transition `contested` -> `cleaned_up` for every match
+    created before `cutoff_dt`.
 
-    Sans ca, un contested non resolu (admin applique l'ELO via /win + /lose
-    mais oublie /match-cancel ou /match-cleanup) bloque les 10 joueurs dans
-    le gate find_active_match_for_player a vie. Appele au boot et chaque
-    tick par le timeout-loop du MatchCog.
+    Without this, an unresolved contested (admin applies ELO via /win + /lose
+    but forgets /match-cancel or /match-cleanup) blocks the 10 players in
+    the find_active_match_for_player gate forever. Called at boot and on
+    every tick by the MatchCog timeout-loop.
 
     Returns:
-        Nombre de docs transitionnes.
+        Number of transitioned docs.
     """
     gid = _to_int_id(origin_guild_id, field="origin_guild_id")
     res = get_matches_col(db).update_many(
@@ -547,18 +663,18 @@ def add_match_vote(
     user_id: int | str,
     choice: str,
 ) -> Mapping[str, Any] | None:
-    """Enregistre/ecrase le vote d'un user. Renvoie le doc apres maj.
+    """Record/overwrite a user's vote. Returns the doc after the update.
 
-    CAS sur `status: pending` : empeche les votes tardifs sur un match
-    deja annule, contesté ou validé. Un retardataire qui clique alors
-    que le match est cancelled n'enregistre rien (None) au lieu de
-    polluer `votes` apres-coup."""
+    CAS on `status: pending`: prevents late votes on a match already
+    cancelled, contested or validated. A latecomer who clicks while the
+    match is cancelled records nothing (None) instead of polluting `votes`
+    after the fact."""
     if choice not in ("a", "b"):
-        raise ValueError(f"choice doit etre 'a' ou 'b', recu {choice!r}")
-    # Coercion centrale comme partout ailleurs dans ce module : garantit une
-    # clef de champ numerique (`votes.<id>`) et rejette tout id non-numerique
-    # avant qu'il n'atteigne Mongo. Sans ca, un `user_id` contenant `.`/`$`
-    # serait interprete comme un chemin de champ imbrique (CWE-943).
+        raise ValueError(f"choice must be 'a' or 'b', received {choice!r}")
+    # Centralized coercion as everywhere else in this module: guarantees a
+    # numeric field key (`votes.<id>`) and rejects any non-numeric id
+    # before it reaches Mongo. Without this, a `user_id` containing `.`/`$`
+    # would be interpreted as a nested field path (CWE-943).
     uid = _to_int_id(user_id, field="user_id")
     return get_matches_col(db).find_one_and_update(
         {"_id": match_id, "status": "pending"},
@@ -588,14 +704,15 @@ def transition_match_status(
     to_status: str,
     validated_at=None,
 ) -> Mapping[str, Any] | None:
-    """Atomic CAS : passe le match de `from_status` a `to_status` uniquement si
-    le doc est encore dans l'etat attendu. Renvoie le doc apres maj, ou None
-    si la transition n'a pas eu lieu (concurrent : un autre vote a deja valide).
+    """Atomic CAS: move the match from `from_status` to `to_status` only if
+    the doc is still in the expected state. Returns the doc after the
+    update, or None if the transition did not happen (concurrent: another
+    vote has already validated).
 
-    Set `validated_at` si la cible est `validated_a` ou `validated_b`. Le
-    parametre `validated_at` permet d'override la valeur (utilise par
-    l'auto-reparation de `check_vote_timeouts` pour referencer le moment
-    ou la majorite a ete reellement atteinte plutot que `now`)."""
+    Set `validated_at` if the target is `validated_a` or `validated_b`. The
+    `validated_at` parameter allows overriding the value (used by the
+    self-repair of `check_vote_timeouts` to reference the moment when the
+    majority was actually reached rather than `now`)."""
     from datetime import datetime
 
     update: dict[str, Any] = {"status": to_status}
@@ -612,13 +729,14 @@ def claim_match_for_elo(
     db: Database,
     match_id: Any,
 ) -> Mapping[str, Any] | None:
-    """Atomic claim : marque `elo_applied=True` uniquement si non deja applique.
+    """Atomic claim: mark `elo_applied=True` only if not already applied.
 
-    Empeche la double-application d'ELO si la verification HenrikDev re-tente
-    apres un crash entre `apply_match_validation` et `set_match_henrik_verified`.
+    Prevents double-application of ELO if the HenrikDev verification
+    retries after a crash between `apply_match_validation` and
+    `set_match_henrik_verified`.
 
     Returns:
-        Le doc apres claim si on a bien obtenu le verrou, None si deja claime.
+        The doc after the claim if we obtained the lock, None if already claimed.
     """
     from datetime import datetime
 
@@ -642,7 +760,7 @@ def release_elo_claim(
     db: Database,
     match_id: Any,
 ) -> None:
-    """Annule le claim si l'application ELO a echoue (rollback)."""
+    """Cancel the claim if the ELO application failed (rollback)."""
     get_matches_col(db).update_one(
         {"_id": match_id},
         {"$unset": {"elo_applied": "", "elo_applied_at": ""}},
@@ -650,11 +768,11 @@ def release_elo_claim(
 
 
 def mark_match_cleanup_started(db: Database, match_id: Any) -> None:
-    """Pose `delete_started_at` sur le doc match juste avant l'appel a
-    `delete_match_category`. Sert de safety net : si le bot crash entre
-    le debut de la suppression (3 salons sur 4 supprimes par exemple) et
-    la transition de status terminal, le startup pourra detecter le
-    cleanup interrompu et reprendre (cf. `find_match_ids_with_cleanup_started`)."""
+    """Set `delete_started_at` on the match doc just before the call to
+    `delete_match_category`. Acts as a safety net: if the bot crashes
+    between the start of the deletion (3 out of 4 channels deleted for
+    example) and the terminal status transition, startup can detect the
+    interrupted cleanup and resume it (see `find_match_ids_with_cleanup_started`)."""
     get_matches_col(db).update_one(
         {"_id": match_id},
         {"$set": {"delete_started_at": datetime.now(UTC)}},
@@ -662,14 +780,14 @@ def mark_match_cleanup_started(db: Database, match_id: Any) -> None:
 
 
 def find_category_ids_with_cleanup_started(db: Database, *, origin_guild_id: int | str) -> set[int]:
-    """Retourne les category_ids des matches ou un cleanup a ete amorce
-    (delete_started_at set). Utilise au boot pour exclure ces categories
-    de l'`active_ids` set : meme si leur status est encore "actif", on
-    sait qu'on a tente de les supprimer -> le cleanup orphelin reprend
-    de maniere idempotente. Sans ce signal, une cleanup interrompue
-    entre l'appel Discord et la mise a jour du status laisserait la
-    categorie orpheline visible mais protegee jusqu'au prochain
-    /match-cleanup admin."""
+    """Returns the category_ids of matches where a cleanup was started
+    (delete_started_at set). Used at boot to exclude these categories
+    from the `active_ids` set: even if their status is still "active", we
+    know we tried to delete them -> the orphan cleanup resumes
+    idempotently. Without this signal, a cleanup interrupted between
+    the Discord call and the status update would leave the orphan
+    category visible but protected until the next admin
+    /match-cleanup."""
     gid = _to_int_id(origin_guild_id, field="origin_guild_id")
     cursor = get_matches_col(db).find(
         {
@@ -688,16 +806,16 @@ def find_validated_unverified(
     *,
     origin_guild_id: int | None = None,
 ) -> list[Mapping[str, Any]]:
-    """Matches validated_a/b avec validated_at <= cutoff_dt, sans Henrik
-    verifie ET sans ELO deja applique (elo_applied != True).
+    """Matches validated_a/b with validated_at <= cutoff_dt, not yet Henrik
+    verified AND without ELO already applied (elo_applied != True).
 
-    Le filtre sur `elo_applied` evite que le tick suivant ne retraite un match
-    dont l'ELO a deja ete applique mais dont `henrik_verified` n'a pas ete
-    ecrit (crash entre les deux operations).
+    The filter on `elo_applied` prevents the next tick from reprocessing a
+    match whose ELO was already applied but whose `henrik_verified` was
+    not written (crash between the two operations).
 
-    Si `origin_guild_id` est fourni, le scan est limite aux matches de cette
-    guild (multi-guild scoping). Sinon, scanne toutes les guilds (compat
-    tests / deploiement single-guild)."""
+    If `origin_guild_id` is provided, the scan is limited to matches of
+    that guild (multi-guild scoping). Otherwise, scans all guilds (compat
+    tests / single-guild deployment)."""
     filt: dict[str, Any] = {
         "status": {"$in": ["validated_a", "validated_b"]},
         "validated_at": {"$lte": cutoff_dt},
@@ -731,12 +849,153 @@ def set_match_henrik_verified(
     )
 
 
-def get_leaderboard_state_col(db: Database, guild_id: int | str) -> Collection:
-    """Stocke l'etat du leaderboard auto-refresh (1 doc par guild).
+def set_match_elo_results(
+    db: Database,
+    match_id: Any,
+    results: Mapping[str, Any],
+) -> None:
+    """Persist the per-player ELO deltas for a validated match.
 
-    Permet au refresh de retrouver son message precedent par `message_id`
-    persiste plutot que par scan de `chan.history(limit=20)`, qui rate
-    les anciens leaderboards si quelqu'un a spamme >=20 messages depuis."""
+    `results` maps user_id -> {delta, old, new, win} (see
+    `elo_updater.build_elo_results`). Idempotent ``$set``: re-running a
+    verification overwrites with identical values. Present only on matches
+    validated after this feature shipped (older matches have no field)."""
+    get_matches_col(db).update_one(
+        {"_id": match_id},
+        {"$set": {"elo_results": dict(results)}},
+    )
+
+
+def set_match_score(
+    db: Database,
+    match_id: Any,
+    score_a: int,
+    score_b: int,
+) -> None:
+    """Persist the final round score (team_a vs team_b) for a match.
+
+    Only available when HenrikDev returned the custom (pro queue); other
+    queues / un-found matches keep no score. Idempotent ``$set``."""
+    get_matches_col(db).update_one(
+        {"_id": match_id},
+        {"$set": {"score_a": int(score_a), "score_b": int(score_b)}},
+    )
+
+
+def set_match_rounds(
+    db: Database,
+    match_id: Any,
+    rounds: list[Mapping[str, Any]],
+) -> None:
+    """Persist the per-round breakdown for a match (website round bar).
+
+    Each entry is ``{"winner": "a"|"b"|"", "end": str}`` (see
+    `match_verifier.compute_round_breakdown`). Henrik-only; idempotent
+    ``$set``."""
+    get_matches_col(db).update_one(
+        {"_id": match_id},
+        {"$set": {"rounds": [dict(r) for r in rounds]}},
+    )
+
+
+def get_match_player_stats_col(db: Database) -> Collection:
+    """Match player stats collection shared across all guilds.
+
+    Stores per-match, per-player stats including damage, kills, deaths,
+    rating 2.0, etc. _id is compound: match_id:user_id."""
+    col = db["match_player_stats"]
+    _ensure_indexes(col, "match_player_stats")
+    return col
+
+
+def insert_match_player_stats(db: Database, docs: list[Mapping[str, Any]]) -> int:
+    """Bulk insert per-match player stat docs. Returns inserted count.
+
+    Idempotent: duplicate _id errors are swallowed (the caller relies
+    on this when the Henrik verifier retries the same match)."""
+    if not docs:
+        return 0
+    from pymongo.errors import BulkWriteError
+
+    col = get_match_player_stats_col(db)
+    try:
+        res = col.insert_many(list(docs), ordered=False)
+        return len(res.inserted_ids)
+    except BulkWriteError as e:
+        details = getattr(e, "details", {}) or {}
+        return int(details.get("nInserted", 0))
+
+
+def get_player_rating_aggregates_col(db: Database) -> Collection:
+    col = db["player_rating_aggregates"]
+    _ensure_indexes(col, "player_rating_aggregates")
+    return col
+
+
+_AGGREGATE_COUNTER_FIELDS: tuple[str, ...] = (
+    "games",
+    "rounds_played",
+    "kills",
+    "deaths",
+    "assists",
+    "damage_made",
+    "damage_received",
+    "headshots",
+    "bodyshots",
+    "legshots",
+    "multikills_2k",
+    "multikills_3k",
+    "multikills_4k",
+    "multikills_5k",
+    "first_kills",
+    "first_deaths",
+    "kast_rounds",
+    "rating_2_0_sum",
+    "acs_sum",
+    "acs_games",
+)
+
+
+def update_rating_aggregates(db: Database, deltas: list[Mapping[str, Any]]) -> None:
+    """For each delta, upsert the {user_id}:{queue_type} aggregate
+    doc, incrementing the counter fields by the delta and stamping
+    updated_at = now.
+    """
+    if not deltas:
+        return
+    col = get_player_rating_aggregates_col(db)
+    now = datetime.now(UTC)
+    for d in deltas:
+        user_id = str(d["user_id"])
+        queue_type = str(d["queue_type"])
+        _check_queue_type(queue_type)
+        inc = {f: d.get(f, 0) for f in _AGGREGATE_COUNTER_FIELDS}
+        col.update_one(
+            {"_id": f"{user_id}:{queue_type}"},
+            {
+                "$inc": inc,
+                "$set": {
+                    "user_id": user_id,
+                    "queue_type": queue_type,
+                    "updated_at": now,
+                },
+            },
+            upsert=True,
+        )
+
+
+def get_rating_aggregate(
+    db: Database, *, user_id: int | str, queue_type: str
+) -> Mapping[str, Any] | None:
+    return get_player_rating_aggregates_col(db).find_one({"_id": f"{user_id}:{queue_type}"})
+
+
+def get_leaderboard_state_col(db: Database, guild_id: int | str) -> Collection:
+    """Stores the auto-refresh leaderboard state (1 doc per guild).
+
+    Allows the refresh to find its previous message via a persisted
+    `message_id` rather than scanning `chan.history(limit=20)`, which
+    misses older leaderboards if someone has spammed >= 20 messages since."""
     return db[f"leaderboard_state_{guild_id}"]
 
 
@@ -778,15 +1037,15 @@ def clear_leaderboard_message_id(
     get_leaderboard_state_col(db, guild_id).delete_one({"_id": leaderboard_state_id(queue_type)})
 
 
-# ── Weekly Pro Queue leaderboard ──────────────────────────────────
-# Collection ELO miroir pour la Pro Queue, videe chaque Lundi 00:00
-# Europe/Paris. Memes champs que la collection `elo` mais usage limite
-# au Pro Queue (queue_type toujours "pro").
+# -- Weekly Pro Queue leaderboard ----------------------------------
+# Mirror ELO collection for the Pro Queue, wiped every Monday 00:00
+# Europe/Paris. Same fields as the `elo` collection but usage limited
+# to the Pro Queue (queue_type always "pro").
 WEEKLY_PRO_QUEUE_TYPE: str = "pro"
 
 
 def get_applications_col(db: Database, guild_id: int | str) -> Collection:
-    """1 collection par guild pour les candidatures (state machine)."""
+    """1 collection per guild for applications (state machine)."""
     return db[f"applications_{guild_id}"]
 
 
@@ -798,8 +1057,8 @@ def register_application(
     *,
     is_staff: bool = False,
 ) -> None:
-    """Enregistre une candidature en etat `pending`. `_id` est le message
-    Discord (qui porte les boutons accept/refuse). Idempotent via $setOnInsert."""
+    """Record an application in the `pending` state. `_id` is the Discord
+    message (carrying the accept/refuse buttons). Idempotent via $setOnInsert."""
     from datetime import datetime
 
     get_applications_col(db, guild_id).update_one(
@@ -824,14 +1083,14 @@ def claim_application_decision(
     status: str,
     decided_by: int | str,
 ) -> bool:
-    """CAS atomique : transitionne la candidature de `pending` vers
-    `accepted` ou `refused`. Renvoie True si on a obtenu la decision,
-    False si un autre admin a deja decide (evite double-traitement :
-    role grant + kick concurrents, double DM, etc.)."""
+    """Atomic CAS: transition the application from `pending` to
+    `accepted` or `refused`. Returns True if we got the decision,
+    False if another admin has already decided (prevents double-handling:
+    concurrent role grant + kick, double DM, etc.)."""
     from datetime import datetime
 
     if status not in ("accepted", "refused"):
-        raise ValueError(f"status invalide : {status}")
+        raise ValueError(f"invalid status: {status}")
     res = get_applications_col(db, guild_id).update_one(
         {"_id": str(message_id), "status": "pending"},
         {
@@ -850,19 +1109,28 @@ def cancel_match_atomically(
     *,
     channel_id: int | str,
 ) -> Mapping[str, Any] | None:
-    """CAS atomique : annule le match du salon `channel_id` si et seulement si
-    son status est encore pending/validated/contested et que l'ELO n'a pas
-    encore ete applique. Sinon renvoie None.
+    """Atomic CAS: cancel the match of channel `channel_id` if and only if
+    its status is still pending/validated/contested and the ELO has not
+    yet been applied. Otherwise returns None.
 
-    Empeche la race entre `match-cancel` et :
-      - un vote concurrent qui validerait le match (find_one verrait `pending`
-        puis update_one ecraserait le `validated_a` deja transitionne)
-      - `_verify_match` qui appliquerait l'ELO (status=cancelled mais
-        elo_applied=True : etat incoherent)."""
+    Prevents the race between `match-cancel` and:
+      - a concurrent vote that would validate the match (find_one would see
+        `pending` then update_one would overwrite the already transitioned
+        `validated_a`)
+      - `_verify_match` which would apply the ELO (status=cancelled but
+        elo_applied=True: inconsistent state)."""
     return get_matches_col(db).find_one_and_update(
         {
             "channel_id": channel_id,
-            "status": {"$in": ["pending", "validated_a", "validated_b", "contested"]},
+            "status": {
+                "$in": [
+                    "preparing",
+                    "pending",
+                    "validated_a",
+                    "validated_b",
+                    "contested",
+                ]
+            },
             "elo_applied": {"$ne": True},
         },
         {"$set": {"status": "cancelled"}},
@@ -870,8 +1138,45 @@ def cancel_match_atomically(
     )
 
 
-# ── Warns (moderation) ────────────────────────────────────────────────
-# Stockage par guild : chaque serveur a son propre historique de warns.
+def force_match_result_atomically(
+    db: Database,
+    *,
+    channel_id: int | str,
+    winner: str,
+) -> Mapping[str, Any] | None:
+    """Atomic CAS: force the winner of the match in `channel_id`.
+
+    Transitions a `pending` or `contested` match (whose ELO has not yet
+    been applied) to `validated_a`/`validated_b`, stamping `validated_at`
+    with the current time. Returns the doc AFTER the update, or None if no
+    eligible match exists (already validated/cancelled/cleaned_up, ELO
+    already applied, or no match in this channel).
+
+    Used by /match-force-result so an admin can settle a vote that timed
+    out (`contested`) — or pre-empt a still-open `pending` vote — without
+    waiting for the 7/10 majority. The downstream HenrikDev verification +
+    ELO application then run exactly as for a normal vote validation.
+
+    The CAS on `status`/`elo_applied` mirrors `cancel_match_atomically`:
+    if a concurrent vote validates the match or `_verify_match` claims the
+    ELO between read and write, the force fails cleanly instead of
+    overwriting an already-settled result."""
+    if winner not in ("a", "b"):
+        raise ValueError(f"winner must be 'a' or 'b', received {winner!r}")
+    to_status = "validated_a" if winner == "a" else "validated_b"
+    return get_matches_col(db).find_one_and_update(
+        {
+            "channel_id": channel_id,
+            "status": {"$in": ["pending", "contested"]},
+            "elo_applied": {"$ne": True},
+        },
+        {"$set": {"status": to_status, "validated_at": datetime.now(UTC)}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+# -- Warns (moderation) --------------------------------------------
+# Per-guild storage: every server has its own warn history.
 
 
 def get_warns_col(db: Database, guild_id: int | str) -> Collection:
@@ -909,9 +1214,9 @@ def list_warns(
     member_id: int | None = None,
     limit: int = 50,
 ) -> list[Mapping[str, Any]]:
-    """Renvoie les warns du guild, du plus recent au plus ancien.
+    """Returns the guild's warns, most recent first.
 
-    Si `member_id` est fourni, filtre sur les warns de ce membre uniquement.
+    If `member_id` is provided, filters on the warns of that member only.
     """
     filt: dict[str, Any] = {}
     if member_id is not None:
@@ -931,8 +1236,10 @@ def reserve_match_number(db: Database, *, guild_id: int) -> int:
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
-    # upsert=True + ReturnDocument.AFTER garantit qu'on a un doc non-None.
-    # L'assert est la pour mypy (typing pymongo : Any | None) et comme
-    # garde-fou si pymongo change ce contrat en future version majeure.
-    assert doc is not None, "find_one_and_update(upsert=True, AFTER) doit renvoyer un doc"
+    # upsert=True + ReturnDocument.AFTER guarantees a non-None doc.
+    # Explicit check (vs `assert`) so the guarantee survives `python -O`.
+    if doc is None:
+        raise RuntimeError(
+            "find_one_and_update(upsert=True, AFTER) returned None — pymongo contract changed"
+        )
     return int(doc["match_counter"])

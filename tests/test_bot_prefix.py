@@ -1,12 +1,12 @@
 """
-Tests d'integration des PREFIX commands (!leaderboard, !stats, !win, !lose).
+Integration tests for PREFIX commands (!leaderboard, !stats, !win, !lose).
 
-Utilise dpytest pour simuler un environnement Discord complet :
-  - Guild factice
-  - Membres factices
-  - Bot reel mais sans connexion Discord
+Uses dpytest to simulate a full Discord environment:
+  - Fake guild
+  - Fake members
+  - Real bot but without Discord connection
 
-Pour lancer :
+To run:
     pip install -r requirements-test.txt
     pytest test_bot_prefix.py -v
 """
@@ -15,10 +15,10 @@ import discord
 import discord.ext.test as dpytest
 
 
-# ── !leaderboard ──────────────────────────────────────────────────
+# -- !leaderboard --
 async def test_leaderboard_empty_says_no_player(discord_bot, fake_guild):
     await dpytest.message("!leaderboard")
-    assert dpytest.verify().message().content("Aucun joueur enregistre.")
+    assert dpytest.verify().message().content("Aucun joueur enregistré.")
 
 
 async def test_leaderboard_shows_one_player(discord_bot, fake_guild):
@@ -38,7 +38,7 @@ async def test_leaderboard_shows_one_player(discord_bot, fake_guild):
 
     await dpytest.message("!leaderboard")
     msg = dpytest.get_message()
-    assert msg.embeds, "Aucun embed dans la reponse"
+    assert msg.embeds, "No embed in the response"
     embed = msg.embeds[0]
     assert "Classement" in embed.title
     assert member.display_name in embed.description
@@ -59,17 +59,17 @@ async def test_leaderboard_orders_by_elo_desc(discord_bot, fake_guild):
     embed = dpytest.get_message().embeds[0]
     desc = embed.description
 
-    # Le joueur a 200 doit apparaitre avant celui a 100, qui apparait avant celui a 50
+    # The 200 ELO player must appear before 100, which appears before 50
     pos_200 = desc.find(members[1].display_name)
     pos_100 = desc.find(members[2].display_name)
     pos_50 = desc.find(members[0].display_name)
-    assert pos_200 < pos_100 < pos_50, "L'ordre par ELO desc n'est pas respecte"
+    assert pos_200 < pos_100 < pos_50, "ELO desc ordering not respected"
 
 
-# ── !stats ────────────────────────────────────────────────────────
+# -- !stats --
 async def test_stats_for_unknown_player(discord_bot, fake_member):
     await dpytest.message("!stats")
-    assert dpytest.verify().message().contains().content("n'a pas encore joue")
+    assert dpytest.verify().message().contains().content("n'a pas encore joué")
 
 
 async def test_stats_shows_winrate(discord_bot, fake_guild, fake_member):
@@ -95,19 +95,19 @@ async def test_stats_shows_winrate(discord_bot, fake_guild, fake_member):
     assert "70" in fields.get("📈 Winrate", "")  # 70%
 
 
-# ── !win / !lose (necessitent permissions) ────────────────────────
+# -- !win / !lose (require permissions) --
 async def test_win_refused_without_permission(discord_bot, fake_guild):
-    # Par defaut le membre 0 dans dpytest n'a pas manage_guild
+    # By default member 0 in dpytest does not have manage_guild
     target = fake_guild.members[1]
     await dpytest.message(f"!win {target.mention}")
-    assert dpytest.verify().message().contains().content("Pas la permission")
+    assert dpytest.verify().message().contains().content("Aucune permission.")
 
 
 async def test_win_grants_elo_with_admin(discord_bot, fake_guild):
-    """Donne manage_guild au membre 0 et verifie le gain d'ELO."""
+    """Grant manage_guild to member 0 and verify the ELO gain."""
     import bot as bot_module
 
-    # Octroi des permissions admin au membre 0 via un role
+    # Grant admin permissions to member 0 via a role
     admin = fake_guild.members[0]
     target = fake_guild.members[1]
     perms = discord.Permissions()
@@ -117,22 +117,22 @@ async def test_win_grants_elo_with_admin(discord_bot, fake_guild):
 
     await dpytest.message(f"!win {target.mention}")
 
-    # Verifier en base - le prefix !win s'applique sur la queue open par defaut
+    # Verify in the database - the !win prefix applies to the open queue by default
     col = bot_module.get_elo_col()
     doc = col.find_one({"_id": f"{target.id}:open"})
-    assert doc is not None, "Le joueur n'a pas ete cree en base"
-    # Pondération par position : slot 0 (joueur1) gagne +20.
-    assert doc["elo"] == 2020, f"ELO attendu 2020, recu {doc['elo']}"
+    assert doc is not None, "Player not created in the database"
+    # Position weighting: slot 0 (player1) earns +20.
+    assert doc["elo"] == 2020, f"Expected ELO 2020, got {doc['elo']}"
     assert doc["wins"] == 1
 
 
 async def test_lose_floors_elo_at_zero(discord_bot, fake_guild):
-    """Un joueur a 5 ELO qui perd ne doit pas descendre sous 0."""
+    """A player at 5 ELO who loses must not drop below 0."""
     import bot as bot_module
 
     admin = fake_guild.members[0]
     target = fake_guild.members[1]
-    partner = fake_guild.members[2]  # 2eme slot (joueur2)
+    partner = fake_guild.members[2]  # 2nd slot (player2)
     perms = discord.Permissions()
     perms.update(manage_guild=True)
     admin_role = await fake_guild.create_role(name="Admin", permissions=perms)
@@ -162,9 +162,9 @@ async def test_lose_floors_elo_at_zero(discord_bot, fake_guild):
         }
     )
 
-    # /lose pondéré par position : slot 0 (target) -> loss=10 -> max(0, 5-10) = 0
+    # /lose weighted by position: slot 0 (target) -> loss=10 -> max(0, 5-10) = 0
     await dpytest.message(f"!lose {target.mention} {partner.mention}")
 
     doc = col.find_one({"_id": f"{target.id}:open"})
-    assert doc["elo"] == 0, f"ELO doit etre clampe a 0, recu {doc['elo']}"
+    assert doc["elo"] == 0, f"ELO must be clamped at 0, got {doc['elo']}"
     assert doc["losses"] == 1
