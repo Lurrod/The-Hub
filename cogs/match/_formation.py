@@ -115,9 +115,9 @@ class FormationMixin(MatchCogState):
             player_ids=[int(p.id) for p in players],
         )
 
-        # Advanced & Draft: captain draft + map ban. Open: auto-balance (by
+        # Advanced: captain draft + map ban. Open & Draft: auto-balance (by
         # peak ELO over the last 6 months) + random map.
-        if queue_type in ("advanced", "draft"):
+        if queue_type == "advanced":
             plan = await self._run_pro_draft_and_ban(
                 interaction,
                 guild,
@@ -285,11 +285,11 @@ class FormationMixin(MatchCogState):
         for uid in player_ids:
             bot_elos.setdefault(uid, elo_calc.ELO_START)
 
-        # Open queue: balance teams on the player's PEAK ELO over the last
-        # 6 months (computed at /link-riot and stored on the Riot doc),
-        # not the accumulated server ELO. Fallback to the server ELO /
+        # Open & Draft queues: balance teams on the player's PEAK ELO over
+        # the last 6 months (computed at /link-riot and stored on the Riot
+        # doc), not the accumulated server ELO. Fallback to the server ELO /
         # ELO_START when the peak is unknown (peak_elo <= 0).
-        if queue_type == "open":
+        if queue_type in ("open", "draft"):
             for uid in player_ids:
                 peak = int((riot_accounts.get(uid) or {}).get("peak_elo", 0) or 0)
                 if peak > 0:
