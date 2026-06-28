@@ -263,11 +263,12 @@ async def test_post_scoreboard_renders_with_actual_image_generator():
     assert sent_file.filename == "scoreboard_advanced.png"
 
 
-def test_results_channels_constant_maps_all_four_queues():
+def test_results_channels_constant_maps_all_queues():
     """Snapshot of RESULTS_CHANNELS: any new queue tier should be wired."""
     from cogs.match import RESULTS_CHANNELS
 
     assert RESULTS_CHANNELS == {
         "open": "open-results",
         "advanced": "advanced-results",
+        "draft": "draft-results",
     }

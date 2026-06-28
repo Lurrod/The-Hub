@@ -630,6 +630,41 @@ async def test_validation_triggers_elo_update_in_db():
         assert doc["losses"] == 1
 
 
+def _seed_match_draft(db, guild_id: int = 42, message_id: int = 555):
+    """Create a validated-able match on the points-less Draft queue."""
+    return repository.create_match(
+        db,
+        origin_guild_id=guild_id,
+        team_a=[{"id": i, "name": f"P{i}", "elo": 2400} for i in range(0, 5)],
+        team_b=[{"id": i, "name": f"P{i}", "elo": 2400} for i in range(5, 10)],
+        map_name="Ascent",
+        lobby_leader_id=0,
+        category_name="Match #1",
+        message_id=message_id,
+        channel_id=100,
+        queue_type="draft",
+    )
+
+
+async def test_draft_queue_applies_no_elo():
+    """Draft queue has no points: validation must not create/change any ELO doc."""
+    import bot as bot_module
+    from cogs.match import MatchCog
+
+    match_id = _seed_match_draft(bot_module.db)
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    guild = _fake_guild(channel=channel)
+
+    cog = MatchCog(bot_module.bot, bot_module.db)
+    await _vote_and_verify(cog, guild, match_id, choice="a", db=bot_module.db)
+
+    # No points awarded on the Draft queue.
+    assert repository.get_elo_col(bot_module.db).count_documents({}) == 0
+    # The match is still claimed/processed so verification runs exactly once.
+    assert repository.get_match(bot_module.db, match_id).get("elo_applied") is True
+
+
 async def test_validation_sends_recap_embed():
     import bot as bot_module
     from cogs.match import MatchCog

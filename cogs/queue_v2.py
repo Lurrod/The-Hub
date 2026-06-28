@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 WAITING_ROOM_NAMES: dict[str, str] = {
     "open": "Waiting Room Open",
     "advanced": "Waiting Room Advanced",
+    "draft": "Waiting Room Draft",
 }
 
 # Allowed roles to join a gated queue (any one of them is enough).
@@ -55,6 +56,7 @@ WAITING_ROOM_NAMES: dict[str, str] = {
 QUEUE_ROLE_GATES: dict[str, tuple[str, ...] | None] = {
     "open": None,
     "advanced": ("Rank Q | Advanced Queue",),
+    "draft": ("Draft",),
 }
 
 # Expected text channel name for each queue (used by /setup to
@@ -62,12 +64,14 @@ QUEUE_ROLE_GATES: dict[str, tuple[str, ...] | None] = {
 QUEUE_CHANNEL_NAMES: dict[str, str] = {
     "open": "open-queue",
     "advanced": "advanced-queue",
+    "draft": "draft-queue",
 }
 
 # Label displayed in the embed title.
 QUEUE_LABELS: dict[str, str] = {
     "open": "Open Queue",
     "advanced": "Advanced Queue",
+    "draft": "Draft Queue",
 }
 
 QUEUE_ROLE_NAME: str = "En Queue"  # global role, shared between all queues
@@ -515,6 +519,7 @@ def _leave_error_message(reason: str) -> str:
 _QUEUE_CHOICES = [
     app_commands.Choice(name="Open", value="open"),
     app_commands.Choice(name="Advanced", value="advanced"),
+    app_commands.Choice(name="Draft", value="draft"),
 ]
 
 

@@ -115,9 +115,9 @@ class FormationMixin(MatchCogState):
             player_ids=[int(p.id) for p in players],
         )
 
-        # Advanced: captain draft + map ban. Open: auto-balance (by peak ELO
-        # over the last 6 months) + random map.
-        if queue_type == "advanced":
+        # Advanced & Draft: captain draft + map ban. Open: auto-balance (by
+        # peak ELO over the last 6 months) + random map.
+        if queue_type in ("advanced", "draft"):
             plan = await self._run_pro_draft_and_ban(
                 interaction,
                 guild,

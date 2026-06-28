@@ -29,14 +29,17 @@ SETUP_CHANNELS = [
     "leaderboard",
     "open-queue",
     "advanced-queue",
+    "draft-queue",
     "open-results",
     "advanced-results",
+    "draft-results",
     "matchs",
 ]
 # Mapping queue_type -> channel name to post the persistent message in.
 QUEUE_CHANNEL_FOR_TYPE = {
     "open": "open-queue",
     "advanced": "advanced-queue",
+    "draft": "draft-queue",
 }
 
 
@@ -109,8 +112,9 @@ class AdminCog(commands.Cog):
                 except discord.Forbidden:
                     queue_status.append(f"⚠️ Impossible d'envoyer dans {chan.mention} (permissions)")
 
-        # 4) Pre-post the leaderboards (silently skip if 0 players)
-        for qt in repository.QUEUE_TYPES:
+        # 4) Pre-post the leaderboards (silently skip if 0 players).
+        # Draft has no leaderboard, so only the ranked queues are posted.
+        for qt in repository.RANKED_QUEUE_TYPES:
             try:
                 await refresh_leaderboard_channel(guild, self.db, qt)
             except Exception:

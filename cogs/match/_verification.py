@@ -7,6 +7,7 @@ import contextlib
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import discord
@@ -374,6 +375,59 @@ class VerificationMixin(MatchCogState):
         )
         if claimed is None:
             return  # Already applied by a previous tick.
+
+        # Draft queue: no ELO, no points, no leaderboard. We only mark the
+        # match processed and post the end-of-game scoreboard (with zero ELO
+        # deltas). The claim above guarantees this runs exactly once.
+        if queue_type == "draft":
+            await asyncio.to_thread(
+                repository.set_match_henrik_verified,
+                self.db,
+                match_doc["_id"],
+                found=(fetched is not None),
+                multipliers=None,
+            )
+            if fetched is not None:
+                summary, team_a_uid_by_puuid, team_b_uid_by_puuid = fetched
+                try:
+                    score_a, score_b = compute_team_scores(
+                        summary, team_a_uid_by_puuid, team_b_uid_by_puuid
+                    )
+                    if score_a is not None and score_b is not None:
+                        await asyncio.to_thread(
+                            repository.set_match_score,
+                            self.db,
+                            match_doc["_id"],
+                            score_a,
+                            score_b,
+                        )
+                except Exception:
+                    logger.exception("[match] set_match_score raised (draft)")
+                try:
+                    rounds = compute_round_breakdown(
+                        summary, team_a_uid_by_puuid, team_b_uid_by_puuid
+                    )
+                    if rounds:
+                        await asyncio.to_thread(
+                            repository.set_match_rounds,
+                            self.db,
+                            match_doc["_id"],
+                            rounds,
+                        )
+                except Exception:
+                    logger.exception("[match] set_match_rounds raised (draft)")
+                try:
+                    await self._post_match_scoreboard(
+                        guild,
+                        summary,
+                        team_a_uid_by_puuid,
+                        team_b_uid_by_puuid,
+                        match_doc,
+                        SimpleNamespace(changes=[]),
+                    )
+                except Exception:
+                    logger.exception("[match] _post_match_scoreboard raised (draft)")
+            return
 
         # ELO can be weighted by Rating 2.0 when Henrik data is available.
         # Build the per-player ratings from the Henrik summary (already

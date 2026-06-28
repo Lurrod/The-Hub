@@ -16,8 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 # Ordered tuple of supported queue types. Order drives display
-# (pre-post leaderboard loops, /setup): Open first, Advanced last.
-QUEUE_TYPES: tuple[str, ...] = ("open", "advanced")
+# (/setup, queue views): Open first, then Advanced, then Draft.
+QUEUE_TYPES: tuple[str, ...] = ("open", "advanced", "draft")
+
+# Queues that carry ELO + a leaderboard. "draft" is intentionally
+# excluded: it only forms teams and posts the end-of-game scoreboard,
+# without points or a ranking.
+RANKED_QUEUE_TYPES: tuple[str, ...] = ("open", "advanced")
 
 
 def is_valid_queue_type(queue_type: str) -> bool:

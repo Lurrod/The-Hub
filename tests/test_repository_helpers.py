@@ -12,12 +12,13 @@ from services.repository import (
 
 
 def test_queue_types_constant():
-    assert QUEUE_TYPES == ("open", "advanced")
+    assert QUEUE_TYPES == ("open", "advanced", "draft")
 
 
 def test_is_valid_queue_type():
     assert is_valid_queue_type("open")
     assert is_valid_queue_type("advanced")
+    assert is_valid_queue_type("draft")
     assert not is_valid_queue_type("pro")
     assert not is_valid_queue_type("gc")
     assert not is_valid_queue_type("OPEN")

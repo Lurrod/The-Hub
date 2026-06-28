@@ -65,6 +65,7 @@ MATCH_HUB_SPECTATOR_ROLE_NAMES: Final[tuple[str, ...]] = ()
 RESULTS_CHANNELS: Final[dict[str, str]] = {
     "open": "open-results",
     "advanced": "advanced-results",
+    "draft": "draft-results",
 }
 
 
@@ -74,6 +75,7 @@ RESULTS_CHANNELS: Final[dict[str, str]] = {
 _QUEUE_LABEL_BY_TYPE: dict[str, str] = {
     "open": "Open Queue",
     "advanced": "Advanced Queue",
+    "draft": "Draft Queue",
 }
 
 # Short prefix used to name the per-match team voice channels, e.g.
@@ -81,4 +83,5 @@ _QUEUE_LABEL_BY_TYPE: dict[str, str] = {
 _QUEUE_PREFIX_BY_TYPE: dict[str, str] = {
     "open": "Open",
     "advanced": "Advanced",
+    "draft": "Draft",
 }
