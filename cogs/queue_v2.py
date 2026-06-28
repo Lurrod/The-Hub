@@ -149,13 +149,13 @@ def build_queue_embed(
 
     if status == "forming":
         color = 0xE67E22
-        state = "🔥 Match Forming..."
+        state = "🔥 Match en formation"
     elif full:
         color = 0x2ECC71
-        state = "🟢 Queue Full !"
+        state = "🟢 Queue pleine !"
     else:
         color = 0x5865F2
-        state = "🔵 Waiting for players"
+        state = "🔵 En attente de joueurs"
 
     embed = discord.Embed(
         title=f"🎮 {label} 10mans - {count}/{QUEUE_SIZE}",
@@ -166,9 +166,9 @@ def build_queue_embed(
 
     if players:
         mentions = "\n".join(f"• <@{uid}>" for uid in players)
-        embed.add_field(name="Players", value=mentions, inline=False)
+        embed.add_field(name="Joueurs", value=mentions, inline=False)
     else:
-        embed.add_field(name="Players", value="*No one yet.*", inline=False)
+        embed.add_field(name="Joueurs", value="*Personne pour le moment.*", inline=False)
 
     embed.set_footer(text=guild.name)
     return embed
@@ -221,7 +221,7 @@ class QueueView(discord.ui.View):
 
         # Boutons a custom_id dynamique (per-instance).
         join: discord.ui.Button = discord.ui.Button(
-            label="Join",
+            label="Rejoindre",
             style=discord.ButtonStyle.success,
             custom_id=f"queue_v2:join:{queue_type}",
         )
@@ -230,7 +230,7 @@ class QueueView(discord.ui.View):
         self.add_item(join)
 
         leave: discord.ui.Button = discord.ui.Button(
-            label="Leave",
+            label="Quitter",
             style=discord.ButtonStyle.danger,
             custom_id=f"queue_v2:leave:{queue_type}",
         )
