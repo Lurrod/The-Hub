@@ -595,7 +595,7 @@ class ApplicationReviewView(discord.ui.View):
         self.db = db
 
     @discord.ui.button(
-        label="Accept",
+        label="Accepter",
         style=discord.ButtonStyle.success,
         custom_id="application_accept",
     )
@@ -777,7 +777,7 @@ class ApplicationReviewView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Decline",
+        label="Refuser",
         style=discord.ButtonStyle.danger,
         custom_id="application_refuse",
     )
