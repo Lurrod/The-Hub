@@ -1007,15 +1007,15 @@ async def test_welcome_application_modal_rejects_unknown_tier():
     db: Any = mongomock.MongoClient(tz_aware=True).db
     review_view = ApplicationReviewView(db=db)
     with pytest.raises(ValueError):
-        ApplicationModal(db=db, review_view=review_view, queue_tier="open")
+        ApplicationModal(db=db, review_view=review_view, queue_tier="nonexistent")
 
 
-# ── WelcomeView Open Queue button (ungated) ──────────────────────
+# ── WelcomeView Open Queue button (application-gated) ────────────
 def _welcome_interaction_with_guild() -> MagicMock:
     """Builds an interaction whose user is a Member in a guild.
 
-    The Open queue is UNGATED in the 2-queue model: clicking the Open
-    button grants no role, it simply confirms instant access."""
+    The Open queue is gated by a candidature in the 2-queue model:
+    clicking the Open button opens an ApplicationModal tagged "open"."""
     member = _fake_member(7, "Candidate", manage_guild=False)
     guild = _fake_guild(99, members=[member])
     guild.roles = []
@@ -1029,36 +1029,43 @@ def _welcome_interaction_with_guild() -> MagicMock:
     return inter
 
 
-async def test_welcome_apply_open_is_ungated_and_grants_no_role():
-    """Click on the Open queue button: it confirms instant access without
-    opening a modal and without granting any queue role (Open is ungated)."""
+async def test_welcome_apply_open_opens_application_modal():
+    """Click on the Open queue button: it opens an ApplicationModal tagged
+    with the "open" queue tier (Open is now gated by a candidature)."""
+    from cogs.applications import ApplicationModal, WelcomeView
+
+    db: Any = mongomock.MongoClient(tz_aware=True).db
+    review_view = ApplicationReviewView(db=db)
+    view = WelcomeView(db=db, review_view=review_view)
+    inter = _welcome_interaction_with_guild()
+
+    await view.apply_open.callback(inter)
+
+    inter.response.send_modal.assert_awaited_once()
+    modal = inter.response.send_modal.call_args.args[0]
+    assert isinstance(modal, ApplicationModal)
+    assert modal.queue_tier == "open"
+    # No instant-access confirmation is sent anymore.
+    inter.response.send_message.assert_not_awaited()
+
+
+async def test_welcome_apply_open_respects_cooldown():
+    """When the user is under the candidature cooldown, the Open button
+    replies with the cooldown message and does NOT open a modal."""
+    from datetime import UTC, datetime
+
     from cogs.applications import WelcomeView
 
     db: Any = mongomock.MongoClient(tz_aware=True).db
     review_view = ApplicationReviewView(db=db)
     view = WelcomeView(db=db, review_view=review_view)
     inter = _welcome_interaction_with_guild()
+    # Seed a fresh cooldown for this user (id 7): they just applied.
+    db["candidature_cooldowns"].insert_one(
+        {"_id": str(inter.user.id), "last_apply": datetime.now(UTC)}
+    )
 
     await view.apply_open.callback(inter)
 
     inter.response.send_modal.assert_not_awaited()
-    # Ungated: no role is granted.
-    inter.user.add_roles.assert_not_awaited()
     inter.response.send_message.assert_awaited_once()
-
-
-async def test_welcome_apply_open_confirms_open_queue_access():
-    """The Open button replies with a French confirmation mentioning the
-    Open queue."""
-    from cogs.applications import WelcomeView
-
-    db: Any = mongomock.MongoClient(tz_aware=True).db
-    review_view = ApplicationReviewView(db=db)
-    view = WelcomeView(db=db, review_view=review_view)
-    inter = _welcome_interaction_with_guild()
-
-    await view.apply_open.callback(inter)
-
-    inter.response.send_message.assert_awaited_once()
-    msg = inter.response.send_message.call_args.args[0]
-    assert "open" in msg.lower()

@@ -79,11 +79,11 @@ def _make_rank_role(name: str):
 def _give_queue_access(member, queue_type: str) -> None:
     """Attach the role required to pass the gate for `queue_type`.
 
-    The Open queue is ungated (no role required); the Advanced queue is
+    The Open queue is gated by the "Members" role; the Advanced queue is
     gated by the "Rank Q | Advanced Queue" role.
     """
     role_map = {
-        "open": None,  # ungated
+        "open": "Members",
         "advanced": "Rank Q | Advanced Queue",
     }
     role_name = role_map[queue_type]
@@ -916,9 +916,40 @@ async def test_join_advanced_queue_allowed_with_role():
     assert "1" in doc["players"]
 
 
-async def test_join_open_queue_is_ungated():
-    """Open Queue has no role gate: any linked player can join without
-    holding any special role."""
+async def test_join_open_queue_requires_members_role():
+    """Open Queue is gated by the "Members" role: a linked player holding
+    that role (granted on candidature accept) can join."""
+    import discord
+
+    import bot as bot_module
+    from cogs.queue_v2 import QueueView
+
+    db = bot_module.db
+    repository.setup_active_queue(
+        db,
+        guild_id=42,
+        queue_type="open",
+        channel_id=100,
+        message_id=999,
+    )
+    _seed_riot_link(db, 42, 1)
+
+    member = _fake_member(1)
+    _give_queue_access(member, "open")  # holds the "Members" role
+    member.__class__ = discord.Member
+    inter = _fake_interaction(member, channel_name="open-queue")
+    inter.user = member
+
+    view = QueueView(db, queue_type="open")
+    await view._join_callback(inter)
+
+    doc = repository.get_active_queue(db, 42, "open")
+    assert "1" in doc["players"]
+
+
+async def test_join_open_queue_refused_without_members_role():
+    """Open Queue rejects a linked player who has not been accepted
+    (no "Members" role)."""
     import discord
 
     import bot as bot_module
@@ -943,9 +974,9 @@ async def test_join_open_queue_is_ungated():
     view = QueueView(db, queue_type="open")
     await view._join_callback(inter)
 
-    # Join succeeds despite holding no role (open is ungated).
+    # Refused: the gate role is missing, so the player is not enqueued.
     doc = repository.get_active_queue(db, 42, "open")
-    assert "1" in doc["players"]
+    assert doc is None or "1" not in doc["players"]
 
 
 async def test_cannot_join_two_queues_simultaneously():
@@ -1037,12 +1068,12 @@ def test_waiting_room_name_per_queue_type():
 
 
 def test_queue_role_gates_per_queue_type():
-    """Snapshot of QUEUE_ROLE_GATES: Open is ungated (None), Advanced is
-    gated by the "Rank Q | Advanced Queue" role. FL CAST is NOT a queue
-    gate — casters access match channels via MATCH_VIEWER_ROLE_NAMES."""
+    """Snapshot of QUEUE_ROLE_GATES: Open is gated by the "Members" role,
+    Advanced is gated by the "Rank Q | Advanced Queue" role. FL CAST is NOT
+    a queue gate — casters access match channels via MATCH_VIEWER_ROLE_NAMES."""
     from cogs.queue_v2 import QUEUE_ROLE_GATES
 
-    assert QUEUE_ROLE_GATES["open"] is None
+    assert QUEUE_ROLE_GATES["open"] == ("Members",)
     assert QUEUE_ROLE_GATES["advanced"] == ("Rank Q | Advanced Queue",)
 
 
@@ -1066,52 +1097,6 @@ def test_queue_role_name_is_en_queue():
     from cogs.queue_v2 import QUEUE_ROLE_NAME
 
     assert QUEUE_ROLE_NAME == "En Queue"
-
-
-async def test_join_pro_queue_allowed_with_fl_pro_role():
-    """Pro Queue: join OK with the FL PRO role (single-role gate)."""
-    import bot as bot_module
-    from cogs.queue_v2 import QueueView
-
-    db = bot_module.db
-    repository.setup_active_queue(
-        db, guild_id=42, queue_type="open", channel_id=100, message_id=999
-    )
-    _seed_riot_link(db, 42, 1)
-
-    member = _fake_member(1)
-    member.roles = [_make_rank_role("FL PRO")]
-    inter = _fake_interaction(member, channel_name="open-queue")
-    inter.user = member
-
-    view = QueueView(db, queue_type="open")
-    await view._join_callback(inter)
-
-    doc = repository.get_active_queue(db, 42, "open")
-    assert "1" in doc["players"]
-
-
-async def test_join_open_queue_allowed_with_fl_open_role():
-    """Open Queue: join OK with the FL OPEN role."""
-    import bot as bot_module
-    from cogs.queue_v2 import QueueView
-
-    db = bot_module.db
-    repository.setup_active_queue(
-        db, guild_id=42, queue_type="open", channel_id=100, message_id=999
-    )
-    _seed_riot_link(db, 42, 1)
-
-    member = _fake_member(1)
-    member.roles = [_make_rank_role("FL OPEN")]
-    inter = _fake_interaction(member, channel_name="open-queue")
-    inter.user = member
-
-    view = QueueView(db, queue_type="open")
-    await view._join_callback(inter)
-
-    doc = repository.get_active_queue(db, 42, "open")
-    assert "1" in doc["players"]
 
 
 async def test_join_advanced_queue_refused_with_unrelated_staff_role():

@@ -2,7 +2,7 @@
 Cog V2 : files 10mans avec boutons persistants (Rejoindre / Quitter).
 
 2 files simultanées par serveur :
-  - File Open : ouverte à tous (aucune restriction de rôle).
+  - File Open : réservée aux joueurs ayant le rôle "Members" (candidature acceptée).
   - File Advanced : réservée aux joueurs ayant le rôle "Rank Q | Advanced Queue".
 
 Invariants :
@@ -54,7 +54,7 @@ WAITING_ROOM_NAMES: dict[str, str] = {
 # Allowed roles to join a gated queue (any one of them is enough).
 # None = no gate.
 QUEUE_ROLE_GATES: dict[str, tuple[str, ...] | None] = {
-    "open": None,
+    "open": ("Members",),
     "advanced": ("Rank Q | Advanced Queue",),
     "draft": ("Draft",),
 }

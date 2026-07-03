@@ -34,20 +34,23 @@ logger = logging.getLogger(__name__)
 
 
 # ── Constants ───────────────────────────────────────────────────
-CANDIDATURE_CHANNEL = "applications"
+CANDIDATURE_CHANNEL = "candidatures"
 WELCOME_CHANNEL = "verify"
 PLAYERS_ROLE = "Members"
 STAFF_ROLE = "Coach/Analyst/Manager"
 TICKETS_CATEGORY_NAME = "Tickets"
 CANDIDATURE_COOLDOWN_SECONDS = 3600
 
-# Player application queues: the single Advanced queue is gated by a role
-# granted on accept. The Apply button on /welcome targets the Advanced
-# queue, the modal carries it through the embed, and the gating role is
-# auto-assigned when an admin clicks Accept.
-# The Open queue is intentionally absent: it is UNGATED (no role required),
-# so the welcome Open button grants no special queue role.
+# Player application queues: BOTH the Open and Advanced queues are gated by a
+# role granted on accept. Each Apply button on /welcome targets a queue, the
+# modal carries it through the embed, and the gating role is auto-assigned
+# when an admin clicks Accept.
+#   - Open     -> "Members" role (the base community/players role).
+#   - Advanced -> "Rank Q | Advanced Queue" role (on top of "Members").
+# The Open gating role intentionally matches PLAYERS_ROLE: accepting an Open
+# candidate simply grants the base role, which the Open queue gate requires.
 QUEUE_TIERS: dict[str, tuple[str, str]] = {
+    "open": ("Open Queue", PLAYERS_ROLE),
     "advanced": ("Advanced Queue", "Rank Q | Advanced Queue"),
 }
 QUEUE_TIER_FIELD_NAME = "🎯 File ciblée"
@@ -827,11 +830,11 @@ def _cooldown_message(remaining: float) -> str:
 
 
 class WelcomeView(discord.ui.View):
-    """Persistent view in #verify: an Apply button for the gated Advanced
-    queue, an instant-access Open queue button, and a
-    Coach/Analyst/Manager button. The Advanced button opens an
-    ApplicationModal tagged with its queue so the gating role can be
-    auto-assigned on accept."""
+    """Persistent view in #verify: one Apply button per gated queue (Open,
+    Advanced) plus a Coach/Analyst/Manager button. Each queue button opens
+    an ApplicationModal tagged with its queue so the gating role can be
+    auto-assigned on accept (Open -> Members, Advanced -> Rank Q | Advanced
+    Queue)."""
 
     def __init__(self, db, review_view: ApplicationReviewView) -> None:
         super().__init__(timeout=None)
@@ -859,20 +862,16 @@ class WelcomeView(discord.ui.View):
         await self._send_application_modal(interaction, "advanced")
 
     @discord.ui.button(
-        label="Rejoindre la File Open",
+        label="Postuler File Open",
         style=discord.ButtonStyle.success,
         custom_id="welcome_apply_open",
         row=0,
     )
     async def apply_open(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """La file Open est libre d'accès (aucun rôle requis) : ce bouton
-        confirme simplement à l'utilisateur qu'il peut rejoindre la file
-        Open, sans attribuer de rôle de file."""
-        await interaction.response.send_message(
-            "✅ La **file Open** est ouverte à tous : rends-toi sur "
-            "`#open-queue` pour lancer une recherche de partie.",
-            ephemeral=True,
-        )
+        """La file Open est gatée par une candidature : ce bouton ouvre le
+        formulaire de candidature (tier Open). À l'acceptation, le rôle
+        `Members` est attribué, ce qui débloque l'accès à la file Open."""
+        await self._send_application_modal(interaction, "open")
 
     @discord.ui.button(
         label="Coach / Analyste / Manager",
@@ -997,11 +996,11 @@ class ApplicationsCog(commands.Cog):
             title="Bienvenue sur le Matchmaking de The Hub",
             description=(
                 "Bienvenue sur un serveur **10mans** avec 2 files :\n\n"
-                "• **File Open** - Ouverte à tous\n"
+                "• **File Open** - Sur candidature\n"
                 "• **File Advanced** - Sur candidature\n\n"
                 "Clique sur le bouton correspondant à la file que tu veux rejoindre. "
-                "La **file Open** est libre d'accès ; la **file Advanced** "
-                "passe par une rapide validation du staff.\n\n"
+                "Chaque file passe par une rapide candidature validée par le staff "
+                "avant d'y accéder.\n\n"
                 "**Amuse-toi bien ! 🍀**"
             ),
             color=0x5865F2,
@@ -1043,7 +1042,7 @@ class ApplicationsCog(commands.Cog):
                 "**Candidature de file** - Postule pour une file privée. Nous "
                 "te demanderons quelle file tu vises, les critères sont :\n"
                 "• File Advanced : sur candidature\n"
-                "• File Open : ouverte à tous"
+                "• File Open : sur candidature"
             ),
             color=0x5865F2,
             timestamp=datetime.now(UTC),
