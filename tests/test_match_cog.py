@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from cogs.match import VOTE_A_BTN_ID, VOTE_B_BTN_ID, MatchCog, VoteView, build_match_embed
-from services import repository
+from services import elo_calc, repository
 from services.team_balancer import Player
 
 
@@ -244,7 +244,7 @@ async def test_on_queue_full_persists_match(monkeypatch):
     match = repository.get_match(bot_module.db, match_id)
     assert match is not None
     assert match["status"] == "pending"
-    assert match["map"] in ("Breeze", "Ascent", "Lotus", "Fracture", "Split", "Haven", "Pearl")
+    assert match["map"] in elo_calc.MAPS
     assert match["category_name"] == "Match #1"
     assert match["message_id"] == 555
     assert match["channel_id"] == 777

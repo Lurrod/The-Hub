@@ -96,7 +96,9 @@ def test_plan_match_returns_balanced_teams_and_random_choices():
     assert len(plan.teams.team_a) == 5
     assert len(plan.teams.team_b) == 5
     # with a seeded rng we can verify stability
-    assert plan.map_name in ("Breeze", "Ascent", "Lotus", "Fracture", "Split", "Haven", "Pearl")
+    from services.elo_calc import MAPS
+
+    assert plan.map_name in MAPS
     assert plan.lobby_leader in players
     assert plan.category_name == "Match #1"
 

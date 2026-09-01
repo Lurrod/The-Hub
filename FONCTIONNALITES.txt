@@ -191,8 +191,8 @@ Quand 10 joueurs sont en queue, le bot :
     (issu du compte Riot lie via HenrikDev), et non l'ELO serveur accumule.
   - Minimise |sum(team_a) - sum(team_b)|.
     Tie-breakers : ecart des peaks puis ordre des IDs (deterministe).
-  - Map tiree au hasard parmi : Breeze, Ascent, Lotus, Fracture, Split,
-    Haven, Pearl.
+  - Map tiree au hasard parmi : Haven, Ascent, Split, Sunset, Abyss,
+    Lotus, Summit.
   - Lobby leader tire au hasard parmi les 10 joueurs.
 
 
@@ -778,7 +778,7 @@ Permissions Discord requises pour le bot :
     ELO_MIN_ROUNDS_FOR_WEIGHT = 6
     ELO_WIN_MIN / ELO_WIN_MAX   = 17 / 26   (bornes du gain pondere)
     ELO_LOSS_MIN / ELO_LOSS_MAX = -15 / -22 (bornes de la perte ponderee)
-    MAPS               = Breeze, Ascent, Lotus, Fracture, Split, Haven, Pearl
+    MAPS               = Haven, Ascent, Split, Sunset, Abyss, Lotus, Summit
 
   cogs/elo_admin.py :
     WIN_DELTAS_BY_SLOT  = (20, 18, 17, 16, 15)   (/win manuel par position)
