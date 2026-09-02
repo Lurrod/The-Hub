@@ -3,15 +3,18 @@ Verification of a bot match via the HenrikDev API and computation of ACS
 multipliers for per-player ELO adjustment.
 
 Flow:
-  1. Fetch the recent custom match history of the lobby leader.
-  2. Find the match containing the 10 expected puuids, started after `after`.
+  1. Fetch the recent custom match history of the lobby, keyed on the
+     puuid of one of its players (immutable, unlike name#tag).
+  2. Find the earliest custom started after `after` sharing at least
+     MIN_PUUID_OVERLAP puuids with the registered players.
   3. Compute each player's ACS and their multiplier (clamped to [0.7, 1.3])
      relative to the team average.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
@@ -22,12 +25,26 @@ from services.riot_api import (
     HenrikDevClient,
     MatchPlayerStats,
     MatchSummary,
+    RateLimitedError,
     RiotApiError,
 )
+
+logger = logging.getLogger(__name__)
 
 CUSTOM_MODE_NAME: Final[str] = "Custom Game"
 DEFAULT_MULT_MIN: Final[float] = 0.7
 DEFAULT_MULT_MAX: Final[float] = 1.3
+
+# Minimum number of registered puuids a Valorant lobby must share with
+# the bot match to be considered the same game. Kept below 10 because a
+# player regularly joins on a second account: requiring all 10 dropped
+# the whole match (no scoreboard, no Rating 2.0, flat ELO) for a single
+# mismatch.
+MIN_PUUID_OVERLAP: Final[int] = 9
+
+# Number of players whose history we may query before giving up. The
+# leader comes first; the others are a fallback for a hard API error.
+MAX_HISTORY_LOOKUPS: Final[int] = 3
 
 
 @dataclass(frozen=True)
@@ -82,35 +99,95 @@ def find_henrik_custom_match(
     client: HenrikDevClient,
     *,
     region: str,
-    leader_name: str,
-    leader_tag: str,
+    lookup_puuids: Sequence[str],
     expected_puuids: set[str],
     after: datetime,
     history_size: int = 10,
+    min_overlap: int = MIN_PUUID_OVERLAP,
 ) -> MatchSummary | None:
-    """Look up a custom match of `leader` that contains `expected_puuids`
-    and started after `after`. Returns the `MatchSummary` or None.
+    """Look up the Valorant custom of the lobby, started after `after`.
+
+    `lookup_puuids` lists the players whose history may be queried, lobby
+    leader first: every player of a custom sees the same match, so the
+    first history HenrikDev answers is enough. A hard API error moves on
+    to the next player — except a 429, which applies to the whole API key
+    and only wastes quota if retried.
+
+    Among the customs started after `after`, the EARLIEST wins. The group
+    frequently queues a new match before the verification runs, and the
+    most recent custom would then be the *following* game, whose stats
+    would be attributed to this match.
+
+    A lobby is accepted when it shares at least `min_overlap` puuids with
+    `expected_puuids` — a player joining on a second account must not
+    void the whole match. Below `min_overlap` registered players (test
+    fixtures), the full set is required.
+
+    Returns the `MatchSummary` or None. Every None path is logged: this
+    lookup is the single gate before the scoreboard, the Rating 2.0 and
+    the extended stats.
     """
-    try:
-        history = client.get_match_history(
-            region,
-            leader_name,
-            leader_tag,
-            size=history_size,
-            mode="custom",
-        )
-    except RiotApiError:
+    if not lookup_puuids:
+        logger.warning("[henrik] no puuid available to look up the custom")
         return None
 
+    required = min(min_overlap, len(expected_puuids))
+    history: list[MatchSummary] | None = None
+    for puuid in lookup_puuids:
+        try:
+            history = client.get_match_history_by_puuid(
+                region,
+                puuid,
+                size=history_size,
+                mode="custom",
+            )
+            break
+        except RateLimitedError:
+            logger.warning("[henrik] rate limited (429): custom lookup aborted")
+            return None
+        except RiotApiError as e:
+            logger.warning("[henrik] history unavailable for puuid %s: %r", puuid, e)
+            continue
+
+    if history is None:
+        logger.warning(
+            "[henrik] no history retrieved after trying %d player(s)",
+            len(lookup_puuids),
+        )
+        return None
+
+    best: MatchSummary | None = None
+    best_overlap = 0
     for match in history:
         if match.mode != CUSTOM_MODE_NAME:
             continue
         if match.started_at < after:
             continue
-        match_puuids = {p.puuid for p in match.players}
-        if expected_puuids.issubset(match_puuids):
-            return match
-    return None
+        overlap = len(expected_puuids & {p.puuid for p in match.players})
+        if overlap < required:
+            continue
+        if best is None or match.started_at < best.started_at:
+            best = match
+            best_overlap = overlap
+
+    if best is None:
+        logger.info(
+            "[henrik] no custom matching the lobby among %d entries "
+            "(>= %d/%d puuids required, started after %s)",
+            len(history),
+            required,
+            len(expected_puuids),
+            after,
+        )
+    else:
+        logger.info(
+            "[henrik] custom %s found (%d/%d puuids, started %s)",
+            best.matchid,
+            best_overlap,
+            len(expected_puuids),
+            best.started_at,
+        )
+    return best
 
 
 def compute_acs_multipliers(

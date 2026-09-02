@@ -38,6 +38,7 @@ from services.match_category import (
     delete_match_category,
 )
 from services.match_verifier import (
+    MAX_HISTORY_LOOKUPS,
     build_extended_stats,
     compute_round_breakdown,
     compute_team_scores,
@@ -659,17 +660,19 @@ class VerificationMixin(MatchCogState):
         # players, we grab them in passing). Grouped in a single thread
         # to avoid freezing the event loop for ~10x10ms.
         def _gather_riot_accounts() -> tuple[
-            Mapping[str, Any] | None, dict[str, str], dict[str, str]
+            Mapping[str, Any] | None, dict[str, str], dict[str, str], str
         ]:
             leader_uid_local = str(match_doc.get("lobby_leader_id"))
             leader: Mapping[str, Any] | None = None
             a_map: dict[str, str] = {}
             b_map: dict[str, str] = {}
+            region_local = ""
             for player in match_doc.get("team_a", []):
                 pid = str(player["id"])
                 r = repository.get_riot_account(self.db, pid)
                 if r and r.get("puuid"):
                     a_map[r["puuid"]] = pid
+                    region_local = region_local or str(r.get("riot_region") or "")
                 if pid == leader_uid_local:
                     leader = r
             for player in match_doc.get("team_b", []):
@@ -677,23 +680,50 @@ class VerificationMixin(MatchCogState):
                 r = repository.get_riot_account(self.db, pid)
                 if r and r.get("puuid"):
                     b_map[r["puuid"]] = pid
+                    region_local = region_local or str(r.get("riot_region") or "")
                 if pid == leader_uid_local:
                     leader = r
             # Fallback: if the leader is no longer one of the 10 (after
             # a /match-replace for example), do a direct lookup.
             if leader is None:
                 leader = repository.get_riot_account(self.db, leader_uid_local)
-            return leader, a_map, b_map
+            return leader, a_map, b_map, region_local
 
-        leader_riot, team_a_uid_by_puuid, team_b_uid_by_puuid = await asyncio.to_thread(
-            _gather_riot_accounts,
-        )
-        if not leader_riot:
-            return None
+        (
+            leader_riot,
+            team_a_uid_by_puuid,
+            team_b_uid_by_puuid,
+            fallback_region,
+        ) = await asyncio.to_thread(_gather_riot_accounts)
 
         expected = set(team_a_uid_by_puuid) | set(team_b_uid_by_puuid)
         if len(expected) < 10:
+            linked = set(team_a_uid_by_puuid.values()) | set(team_b_uid_by_puuid.values())
+            missing = [
+                str(p["id"])
+                for p in (*match_doc.get("team_a", []), *match_doc.get("team_b", []))
+                if str(p["id"]) not in linked
+            ]
+            logger.warning(
+                "[match] match %s: only %d/10 players have a linked Riot account "
+                "(missing: %s) - no scoreboard possible",
+                match_doc.get("_id"),
+                len(expected),
+                missing,
+            )
             return None
+
+        # The history is queried by puuid (immutable) and not by name#tag,
+        # which breaks for good as soon as a player renames their Riot ID.
+        # The leader comes first, the others are a fallback for a hard
+        # API error - all of them saw the same custom.
+        leader_puuid = str((leader_riot or {}).get("puuid") or "")
+        ordered_puuids = [*team_a_uid_by_puuid, *team_b_uid_by_puuid]
+        lookup_puuids = ([leader_puuid] if leader_puuid else []) + [
+            pu for pu in ordered_puuids if pu != leader_puuid
+        ]
+        lookup_puuids = lookup_puuids[:MAX_HISTORY_LOOKUPS]
+        region = str((leader_riot or {}).get("riot_region") or fallback_region or "eu")
 
         after = match_doc.get("created_at") or match_doc.get("validated_at")
 
@@ -717,9 +747,8 @@ class VerificationMixin(MatchCogState):
             summary = await asyncio.to_thread(
                 find_henrik_custom_match,
                 self.henrik_client,
-                region=str(leader_riot.get("riot_region", "eu")),
-                leader_name=str(leader_riot.get("riot_name", "")),
-                leader_tag=str(leader_riot.get("riot_tag", "")),
+                region=region,
+                lookup_puuids=lookup_puuids,
                 expected_puuids=expected,
                 after=after,
             )

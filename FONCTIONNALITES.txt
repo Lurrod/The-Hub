@@ -281,6 +281,21 @@ un Rating 2.0 par joueur (voir section 7).
     - Si depasse 30 min -> applique l'ELO PLAT (gain=20 / perte=20 chacun),
       sans Rating 2.0 ni scoreboard
 
+  Recherche du custom (find_henrik_custom_match) :
+    - Interrogation de l'historique par PUUID (immuable), jamais par
+      pseudo#tag : un joueur qui renomme son Riot ID rendait la recherche
+      404 definitivement (plus aucun scoreboard).
+    - Leader du lobby interroge en premier, puis 2 autres joueurs en repli
+      si l'API echoue (MAX_HISTORY_LOOKUPS = 3). Un 429 arrete tout de
+      suite : il concerne la cle entiere.
+    - Parmi les customs demarres apres la creation du match, le PLUS
+      ANCIEN est retenu : le groupe relance souvent une partie avant la
+      verification, et le plus recent serait le match suivant.
+    - Tolerance MIN_PUUID_OVERLAP = 9 puuids sur 10 : un joueur qui rejoint
+      le lobby Valorant sur un second compte ne doit pas annuler tout le
+      match. Ce joueur n'a alors ni ligne dans le scoreboard ni Rating 2.0
+      (ELO plat +/-20 pour lui uniquement).
+
   Circuit breaker Henrik :
     - HENRIK_CIRCUIT_FAIL_THRESHOLD = 3 echecs consecutifs -> circuit ouvert
     - HENRIK_CIRCUIT_OPEN_MINUTES = 5 min de suspension des appels

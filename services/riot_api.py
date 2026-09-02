@@ -313,6 +313,31 @@ class HenrikDevClient:
         data = self._get(path, cache=False)
         return [_parse_match(entry) for entry in data.get("data", [])]
 
+    def get_match_history_by_puuid(
+        self,
+        region: str,
+        puuid: str,
+        *,
+        size: int = 5,
+        mode: str | None = None,
+    ) -> list[MatchSummary]:
+        """Same as `get_match_history`, keyed on the immutable puuid.
+
+        A Riot ID (name#tag) can be changed at any time by its owner: the
+        name#tag stored at `/link-riot` time then returns HTTP 404 for
+        good, which silently killed the match verification (no scoreboard,
+        no Rating 2.0). The puuid never changes, and HenrikDev returns the
+        exact same v3 payload on this route."""
+        if region not in VALID_REGIONS:
+            raise ValueError(f"Invalid region: {region}")
+        path = f"/v3/by-puuid/matches/{region}/{quote(puuid, safe='')}?size={int(size)}"
+        if mode:
+            path += f"&mode={quote(str(mode), safe='')}"
+        # No cache, same reason as get_match_history: this endpoint is
+        # polled to detect the appearance of a recent custom.
+        data = self._get(path, cache=False)
+        return [_parse_match(entry) for entry in data.get("data", [])]
+
     def get_match_details(self, matchid: str) -> MatchSummary:
         """Full detail of a match from its id."""
         data = self._get(f"/v2/match/{quote(matchid, safe='')}")

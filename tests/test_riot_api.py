@@ -275,6 +275,43 @@ def test_get_match_history_does_not_pollute_cache():
     assert all("/matches/" not in k for k in client._cache._store.keys())
 
 
+# ── get_match_history_by_puuid ────────────────────────────────────
+def test_get_match_history_by_puuid_uses_by_puuid_endpoint():
+    """Riot IDs change, puuids do not. The match verification queries the
+    history by puuid so a renamed player is still resolved (name#tag
+    returns HTTP 404 for good once the player renames)."""
+    session = _make_session(_mock_response(200, {"status": 200, "data": []}))
+    client = HenrikDevClient(session=session)
+
+    client.get_match_history_by_puuid("eu", "abc-123", size=10, mode="custom")
+
+    url = session.get.call_args[0][0]
+    assert "/v3/by-puuid/matches/eu/abc-123" in url
+    assert "size=10" in url
+    assert "mode=custom" in url
+
+
+def test_get_match_history_by_puuid_bypasses_cache():
+    session = MagicMock()
+    session.get.side_effect = [
+        _mock_response(200, {"status": 200, "data": []}),
+        _mock_response(200, {"status": 200, "data": []}),
+    ]
+    client = HenrikDevClient(session=session)
+
+    client.get_match_history_by_puuid("eu", "abc-123", mode="custom")
+    client.get_match_history_by_puuid("eu", "abc-123", mode="custom")
+
+    assert session.get.call_count == 2
+    assert not client._cache._store
+
+
+def test_get_match_history_by_puuid_rejects_invalid_region():
+    client = HenrikDevClient(session=_make_session(_mock_response(200, {"status": 200})))
+    with pytest.raises(ValueError):
+        client.get_match_history_by_puuid("mars", "abc-123")
+
+
 # ── Headers ───────────────────────────────────────────────────────
 def test_api_key_added_to_headers_when_provided():
     session = _make_session(_mock_response(200, {"status": 200, "data": {}}))

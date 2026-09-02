@@ -22,7 +22,12 @@ from services.match_verifier import (
     compute_acs_multipliers,
     find_henrik_custom_match,
 )
-from services.riot_api import MatchPlayerStats, MatchSummary, RiotApiError
+from services.riot_api import (
+    MatchPlayerStats,
+    MatchSummary,
+    RateLimitedError,
+    RiotApiError,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -62,6 +67,30 @@ def _summary(
 
 
 # ── find_henrik_custom_match ──────────────────────────────────────
+def _client(history=(), *, by_puuid=None):
+    """MagicMock HenrikDev client for the by-puuid history lookup.
+
+    `by_puuid` maps a puuid to its history (or to an exception to raise)
+    when a test needs a different answer per player."""
+    client = MagicMock()
+    if by_puuid is None:
+        client.get_match_history_by_puuid.return_value = list(history)
+    else:
+
+        def _side_effect(region, puuid, **kwargs):
+            res = by_puuid[puuid]
+            if isinstance(res, Exception):
+                raise res
+            return res
+
+        client.get_match_history_by_puuid.side_effect = _side_effect
+    return client
+
+
+def _ten_puuids() -> set[str]:
+    return {f"p{i}" for i in range(10)}
+
+
 def test_find_custom_returns_match_when_puuids_match():
     started = datetime.now(UTC)
     expected = {"a", "b", "c"}
@@ -70,14 +99,11 @@ def test_find_custom_returns_match_when_puuids_match():
         started_at=started,
         players=tuple(_stats(p, "Red" if p in ("a", "b") else "Blue") for p in "abc"),
     )
-    client = MagicMock()
-    client.get_match_history.return_value = [target]
 
     result = find_henrik_custom_match(
-        client,
+        _client([target]),
         region="eu",
-        leader_name="L",
-        leader_tag="T",
+        lookup_puuids=["a"],
         expected_puuids=expected,
         after=started - timedelta(minutes=5),
     )
@@ -85,94 +111,135 @@ def test_find_custom_returns_match_when_puuids_match():
     assert result.matchid == "M_OK"
 
 
+def test_find_custom_queries_by_puuid_not_name_tag():
+    """A player who renames their Riot ID makes the stored name#tag
+    return HTTP 404 forever. The puuid is immutable, so the lookup must
+    go through /v3/by-puuid/matches."""
+    started = datetime.now(UTC)
+    client = _client([])
+
+    find_henrik_custom_match(
+        client,
+        region="eu",
+        lookup_puuids=["puuid-1", "puuid-2"],
+        expected_puuids={"puuid-1"},
+        after=started,
+    )
+
+    client.get_match_history.assert_not_called()
+    client.get_match_history_by_puuid.assert_called_once()
+    args, kwargs = client.get_match_history_by_puuid.call_args
+    assert args[0] == "eu"
+    assert args[1] == "puuid-1"
+    assert kwargs["mode"] == "custom"
+
+
 def test_find_custom_skips_non_custom_mode():
     started = datetime.now(UTC)
-    expected = {"a", "b"}
-    # Mode "Competitive" but contains the right puuids
     wrong_mode = _summary(
         matchid="M_COMP",
         mode="Competitive",
         started_at=started,
         players=tuple(_stats(p, "Red") for p in "ab"),
     )
-    client = MagicMock()
-    client.get_match_history.return_value = [wrong_mode]
 
     result = find_henrik_custom_match(
-        client,
+        _client([wrong_mode]),
         region="eu",
-        leader_name="L",
-        leader_tag="T",
-        expected_puuids=expected,
+        lookup_puuids=["a"],
+        expected_puuids={"a", "b"},
         after=started - timedelta(minutes=5),
     )
     assert result is None
 
 
 def test_find_custom_skips_matches_before_after():
-    expected = {"a", "b"}
     too_old = _summary(
         matchid="M_OLD",
         started_at=datetime.now(UTC) - timedelta(hours=2),
         players=tuple(_stats(p, "Red") for p in "ab"),
     )
-    client = MagicMock()
-    client.get_match_history.return_value = [too_old]
 
     result = find_henrik_custom_match(
-        client,
+        _client([too_old]),
         region="eu",
-        leader_name="L",
-        leader_tag="T",
-        expected_puuids=expected,
+        lookup_puuids=["a"],
+        expected_puuids={"a", "b"},
         after=datetime.now(UTC) - timedelta(minutes=30),
     )
     assert result is None
 
 
-def test_find_custom_skips_when_puuids_incomplete():
+def test_find_custom_accepts_nine_of_ten_puuids():
+    """A player joining the Valorant lobby on a second account leaves 9
+    of the 10 registered puuids in the custom. Requiring all 10 silently
+    dropped the whole match (no scoreboard, no Rating 2.0)."""
     started = datetime.now(UTC)
-    expected = {"a", "b", "c"}  # 3 expected
-    # The match only has 2 of the 3 puuids
+    # 9 registered puuids + 1 stranger => overlap 9/10
+    lobby = [f"p{i}" for i in range(9)] + ["stranger"]
     partial = _summary(
-        matchid="M_PARTIAL",
+        matchid="M_9_OF_10",
         started_at=started,
-        players=tuple(_stats(p, "Red") for p in "ab"),
+        players=tuple(_stats(p, "Red") for p in lobby),
     )
-    client = MagicMock()
-    client.get_match_history.return_value = [partial]
 
     result = find_henrik_custom_match(
-        client,
+        _client([partial]),
         region="eu",
-        leader_name="L",
-        leader_tag="T",
-        expected_puuids=expected,
+        lookup_puuids=["p0"],
+        expected_puuids=_ten_puuids(),
+        after=started - timedelta(minutes=5),
+    )
+    assert result is not None
+    assert result.matchid == "M_9_OF_10"
+
+
+def test_find_custom_rejects_eight_of_ten_puuids():
+    """Below the tolerance the custom is probably another lobby."""
+    started = datetime.now(UTC)
+    lobby = [f"p{i}" for i in range(8)] + ["x", "y"]
+    partial = _summary(
+        matchid="M_8_OF_10",
+        started_at=started,
+        players=tuple(_stats(p, "Red") for p in lobby),
+    )
+
+    result = find_henrik_custom_match(
+        _client([partial]),
+        region="eu",
+        lookup_puuids=["p0"],
+        expected_puuids=_ten_puuids(),
         after=started - timedelta(minutes=5),
     )
     assert result is None
 
 
-def test_find_custom_returns_none_on_riot_error():
-    client = MagicMock()
-    client.get_match_history.side_effect = RiotApiError("HenrikDev 503")
+def test_find_custom_skips_when_puuids_incomplete():
+    """With fewer than `min_overlap` registered puuids the whole set is
+    required — a 3-player fixture cannot tolerate a miss."""
+    started = datetime.now(UTC)
+    partial = _summary(
+        matchid="M_PARTIAL",
+        started_at=started,
+        players=tuple(_stats(p, "Red") for p in "ab"),
+    )
 
     result = find_henrik_custom_match(
-        client,
+        _client([partial]),
         region="eu",
-        leader_name="L",
-        leader_tag="T",
-        expected_puuids={"a"},
-        after=datetime.now(UTC),
+        lookup_puuids=["a"],
+        expected_puuids={"a", "b", "c"},
+        after=started - timedelta(minutes=5),
     )
     assert result is None
 
 
-def test_find_custom_returns_first_matching_in_history():
-    """The client returns the history from most recent to oldest. We must
-    take the first one that matches, not the last."""
+def test_find_custom_returns_earliest_custom_after_cutoff():
+    """The history comes back newest-first, but the match we verify is
+    the FIRST custom started after the bot created it. Taking the newest
+    attributed the next game's stats to the previous match whenever the
+    group queued again before the verification ran."""
     started = datetime.now(UTC)
-    expected = {"a", "b"}
     newer = _summary(
         matchid="M_NEW",
         started_at=started,
@@ -183,19 +250,80 @@ def test_find_custom_returns_first_matching_in_history():
         started_at=started - timedelta(minutes=10),
         players=tuple(_stats(p, "Red") for p in "ab"),
     )
-    client = MagicMock()
-    client.get_match_history.return_value = [newer, older]
+
+    result = find_henrik_custom_match(
+        _client([newer, older]),
+        region="eu",
+        lookup_puuids=["a"],
+        expected_puuids={"a", "b"},
+        after=started - timedelta(hours=1),
+    )
+    assert result is not None
+    assert result.matchid == "M_OLD"
+
+
+def test_find_custom_returns_none_on_riot_error():
+    client = _client(by_puuid={"a": RiotApiError("HenrikDev 503")})
 
     result = find_henrik_custom_match(
         client,
         region="eu",
-        leader_name="L",
-        leader_tag="T",
-        expected_puuids=expected,
-        after=started - timedelta(hours=1),
+        lookup_puuids=["a"],
+        expected_puuids={"a"},
+        after=datetime.now(UTC),
+    )
+    assert result is None
+
+
+def test_find_custom_falls_back_to_next_puuid_on_api_error():
+    """The leader's history can fail (private account, Henrik hiccup).
+    Another player of the same lobby saw the same custom."""
+    started = datetime.now(UTC)
+    target = _summary(
+        matchid="M_FALLBACK",
+        started_at=started,
+        players=tuple(_stats(p, "Red") for p in "ab"),
+    )
+    client = _client(by_puuid={"a": RiotApiError("boom"), "b": [target]})
+
+    result = find_henrik_custom_match(
+        client,
+        region="eu",
+        lookup_puuids=["a", "b"],
+        expected_puuids={"a", "b"},
+        after=started - timedelta(minutes=5),
     )
     assert result is not None
-    assert result.matchid == "M_NEW"
+    assert result.matchid == "M_FALLBACK"
+
+
+def test_find_custom_stops_immediately_on_rate_limit():
+    """A 429 hits the whole key: retrying with another player only burns
+    more quota."""
+    client = _client(by_puuid={"a": RateLimitedError("429"), "b": []})
+
+    result = find_henrik_custom_match(
+        client,
+        region="eu",
+        lookup_puuids=["a", "b"],
+        expected_puuids={"a", "b"},
+        after=datetime.now(UTC),
+    )
+    assert result is None
+    assert client.get_match_history_by_puuid.call_count == 1
+
+
+def test_find_custom_returns_none_without_lookup_puuids():
+    client = _client([])
+    result = find_henrik_custom_match(
+        client,
+        region="eu",
+        lookup_puuids=[],
+        expected_puuids={"a"},
+        after=datetime.now(UTC),
+    )
+    assert result is None
+    client.get_match_history_by_puuid.assert_not_called()
 
 
 # ── compute_acs_multipliers ───────────────────────────────────────
