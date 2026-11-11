@@ -7,13 +7,13 @@ from typing import Final
 # -- Constants -----------------------------------------------------
 ELO_START: Final[int] = 2000
 MAPS: Final[tuple[str, ...]] = (
-    "Haven",
-    "Ascent",
-    "Split",
-    "Sunset",
     "Abyss",
+    "Bind",
+    "Corrode",
+    "Haven",
     "Lotus",
     "Summit",
+    "Sunset",
 )
 
 

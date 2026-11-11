@@ -246,7 +246,7 @@ round_end_types = [
 ]
 
 buf = generate_scoreboard(
-    map_name="Ascent",
+    map_name="Bind",
     rounds_a=13,
     rounds_b=8,
     team_a_label="Team A",

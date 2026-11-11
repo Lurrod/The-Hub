@@ -4,9 +4,16 @@ from services import elo_calc
 
 
 # ── Constantes ────────────────────────────────────────────────────
-def test_maps_list_not_empty():
-    assert len(elo_calc.MAPS) >= 5
-    assert "Ascent" in elo_calc.MAPS
+def test_maps_is_current_competitive_pool():
+    assert elo_calc.MAPS == (
+        "Abyss",
+        "Bind",
+        "Corrode",
+        "Haven",
+        "Lotus",
+        "Summit",
+        "Sunset",
+    )
 
 
 def test_elo_start_is_2000():
