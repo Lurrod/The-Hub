@@ -1,12 +1,9 @@
-"""Pro / Semi-Pro Queue Map Pick & Ban Service.
+"""Map Pick & Ban Service (used by every queue after the captain draft).
 
 Used after the captain draft completes: cap_a bans first, then alternating
 ABABAB (6 bans on 7 maps). The 1 remaining map is the match map. The
 captain who did NOT make the final ban (cap_a, since BAN_SEQUENCE ends on
 "B") then picks the side (Attack / Defense) for their team.
-
-Module isolated by queue: open and gc queues do NOT call this. They keep
-plan_match (random map).
 
 Module structure mirrors services/captain_draft.py for consistency:
   - pure MapBanState dataclass (immutable, testable)

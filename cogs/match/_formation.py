@@ -43,13 +43,22 @@ from services.match_service import (
     MatchPlan,
     build_plan_from_draft,
     build_players,
-    plan_match,
     serialize_team,
 )
 from services.repository import reserve_match_number
 from services.team_balancer import Player
 
 logger = logging.getLogger(__name__)
+
+
+def find_match_vc(category: Any, base_name: str) -> Any | None:
+    """Return the VC named `base_name` in `category`, with or without the
+    queue prefix added by create_match_category ("Draft - Team 1")."""
+    suffix = f" - {base_name}"
+    for vc in category.voice_channels:
+        if vc.name == base_name or vc.name.endswith(suffix):
+            return vc
+    return None
 
 
 class FormationMixin(MatchCogState):
@@ -115,23 +124,19 @@ class FormationMixin(MatchCogState):
             player_ids=[int(p.id) for p in players],
         )
 
-        # Advanced: captain draft + map ban. Open & Draft: auto-balance (by
-        # peak ELO over the last 6 months) + random map.
-        if queue_type == "advanced":
-            plan = await self._run_pro_draft_and_ban(
-                interaction,
-                guild,
-                prep_channel,
-                players,
-                match_number=match_number,
-                category=category,
-                preparing_match_id=preparing_match_id,
-                free_cat_name=free_cat_name,
-            )
-            if plan is None:
-                return None
-        else:
-            plan = plan_match(players, free_category=free_cat_name, rng=self.rng)
+        # Every queue: captain draft (2 random captains) + map ban.
+        plan = await self._run_pro_draft_and_ban(
+            interaction,
+            guild,
+            prep_channel,
+            players,
+            match_number=match_number,
+            category=category,
+            preparing_match_id=preparing_match_id,
+            free_cat_name=free_cat_name,
+        )
+        if plan is None:
+            return None
 
         # Setup ordering: the match doc was already inserted with
         # status='preparing' before captain draft / map ban started, so
@@ -221,7 +226,7 @@ class FormationMixin(MatchCogState):
                 )
 
         # Step 6: voice move Waiting Room -> Team 1/Team 2 based on
-        # the assignment computed by balance_teams. Players land
+        # the captain draft. Players land
         # directly in their team VC, no need to re-split after the
         # Waiting Match gathering.
         await self._move_players_to_match_vc(guild, free_cat_name, plan)
@@ -285,10 +290,11 @@ class FormationMixin(MatchCogState):
         for uid in player_ids:
             bot_elos.setdefault(uid, elo_calc.ELO_START)
 
-        # Open & Draft queues: balance teams on the player's PEAK ELO over
-        # the last 6 months (computed at /link-riot and stored on the Riot
-        # doc), not the accumulated server ELO. Fallback to the server ELO /
-        # ELO_START when the peak is unknown (peak_elo <= 0).
+        # Open & Draft queues: the ELO shown to captains in the draft pool
+        # is the player's PEAK ELO over the last 6 months (computed at
+        # /link-riot and stored on the Riot doc), not the accumulated server
+        # ELO. Fallback to the server ELO / ELO_START when the peak is
+        # unknown (peak_elo <= 0).
         if queue_type in ("open", "draft"):
             for uid in player_ids:
                 peak = int((riot_accounts.get(uid) or {}).get("peak_elo", 0) or 0)
@@ -324,7 +330,7 @@ class FormationMixin(MatchCogState):
         preparing_match_id: Any,
         free_cat_name: str,
     ) -> MatchPlan | None:
-        """Run captain draft + map ban for the advanced flow.
+        """Run captain draft + map ban (used by every queue).
 
         Returns the match plan, or None when the draft/ban is cancelled or
         fails — in which case the preparing doc and the Discord category are
@@ -596,12 +602,9 @@ class FormationMixin(MatchCogState):
         category = discord.utils.get(guild.categories, name=free_cat_name)
         if category is None:
             return
-        team1_vc = discord.utils.get(category.voice_channels, name="Team 1")
-        team2_vc = discord.utils.get(category.voice_channels, name="Team 2")
-        waiting_match = discord.utils.get(
-            category.voice_channels,
-            name="Waiting Match",
-        )
+        team1_vc = find_match_vc(category, "Team 1")
+        team2_vc = find_match_vc(category, "Team 2")
+        waiting_match = find_match_vc(category, "Waiting Match")
 
         # uid -> target VC mapping. team_a -> Team 1, team_b -> Team 2.
         # If a team VC is missing, fall back to the other one then to
@@ -652,7 +655,7 @@ class FormationMixin(MatchCogState):
     ) -> None:
         """Move all `player_ids` to the 'Waiting Match' VC of `category`.
 
-        Used on the advanced branch BEFORE the captain draft, so the
+        Used BEFORE the captain draft, so the
         10 players are grouped in one VC while captains pick their teams.
 
         Guards:
@@ -660,7 +663,7 @@ class FormationMixin(MatchCogState):
           - skip if member is not in voice
           - skip if already at destination
         """
-        waiting_match = discord.utils.get(category.voice_channels, name="Waiting Match")
+        waiting_match = find_match_vc(category, "Waiting Match")
         if waiting_match is None:
             logger.warning(
                 "[match] _move_players_to_waiting_match: 'Waiting Match' not found in %s, no-op",
@@ -685,7 +688,7 @@ class FormationMixin(MatchCogState):
                 with contextlib.suppress(discord.Forbidden, discord.HTTPException):
                     await member.move_to(
                         waiting_match,
-                        reason="File advanced : regroupement avant le draft des capitaines",
+                        reason="Regroupement avant le draft des capitaines",
                     )
 
         await asyncio.gather(

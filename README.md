@@ -57,12 +57,12 @@ Cycle complet d'une partie :
 - Refusé si pas de compte Riot lié, déjà en queue, déjà dans un match en cours (catégorie `Match #N` encore active), ou rôle gate manquant.
 - Le joueur qui quitte le serveur est automatiquement retiré des queues (`on_member_remove`).
 
-### Équilibrage des équipes
+### Formation des équipes : draft de capitaines
 
-- Algo **brute-force optimal** : itère les 126 partitions 5+5 uniques parmi 10.
-- Minimise `|sum(team_a) - sum(team_b)|`.
-- Tie-breakers : peak diff puis ordre des IDs (déterministe).
-- Source d'ELO utilisée : **ELO serveur** (`elo_<guild>.elo`), seedée au `/link-riot`.
+- Toutes les files (Open, Advanced, Draft) passent par un **draft de capitaines**.
+- 2 capitaines **tirés au hasard** parmi les 10 joueurs, puis picks en serpent `A B B A A B B A`.
+- Ensuite pick/ban de map (6 bans alternés sur 7 maps) et choix du côté.
+- ELO affiché dans le pool : peak 6 mois (Open, Draft) ou ELO serveur de la file (Advanced).
 
 ### Formation de match - catégories dynamiques
 
@@ -285,6 +285,7 @@ Le bot doit avoir : `Voir les salons`, `Envoyer des messages`, `Intégrer des li
 |--------------------|----------------------------------------------|
 | `/map`             | Map aléatoire parmi les 7 maps               |
 | `/clear nombre:`   | Supprime jusqu'à 100 messages                |
+| `/admin-unlink-riot membre:` ou `riot_id:` | Délie le compte Riot d'un membre, ou un Riot ID (même si le membre a quitté le serveur) |
 | `/help type:`      | Liste des commandes (membres ou admin)       |
 
 ### Commandes prefix (legacy)

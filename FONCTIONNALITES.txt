@@ -14,11 +14,9 @@ critere.
 
 Les deux queues sont competitives : chaque match valide donne lieu a une
 verification HenrikDev, un calcul de Rating 2.0 par joueur, un ELO pondere
-par la performance et une image scoreboard. La seule difference entre les deux
-queues est la maniere de former les equipes :
-
-  - Open     : equipes auto-equilibrees selon le PEAK ELO des 6 derniers mois.
-  - Advanced : equipes formees par DRAFT DE CAPITAINES + pick/ban de map.
+par la performance et une image scoreboard. Toutes les queues (Open,
+Advanced, Draft) forment les equipes par DRAFT DE CAPITAINES (2 capitaines
+tires au hasard) + pick/ban de map.
 
 
 ================================================================================
@@ -137,6 +135,11 @@ queues est la maniere de former les equipes :
   /unlink-riot
     Supprime la liaison avec ton compte Riot.
 
+  /admin-unlink-riot membre:@joueur | riot_id:Pseudo#TAG   (admin)
+    Supprime la liaison Riot d'un membre, ou celle d'un Riot ID precis
+    (recherche insensible a la casse ; utile si le membre a quitte le
+    serveur et bloque le Riot ID). Un seul des deux parametres a la fois.
+
 
 ================================================================================
 3. FORMATION DES EQUIPES
@@ -148,7 +151,7 @@ Quand 10 joueurs sont en queue, le bot :
        - 10 comptes Riot (riot)
        - 10 docs ELO compound (elo, _id="<uid>:<queue_type>")
 
-  2. Forme les 2 equipes selon le TYPE DE QUEUE (voir 3.1 et 3.2).
+  2. Forme les 2 equipes selon le TYPE DE QUEUE (voir 3.1).
 
   3. Cree dynamiquement une categorie "Match #N" avec match-preparation + Team 1
      + Team 2 + Waiting Match, et applique des permissions directes sur les 10
@@ -182,26 +185,17 @@ Quand 10 joueurs sont en queue, le bot :
 
 
 --------------------------------------------------------------------------------
-3.1 QUEUE OPEN - AUTO-EQUILIBRAGE PAR PEAK ELO (6 DERNIERS MOIS)
---------------------------------------------------------------------------------
-
-  - Aucun draft : les equipes sont equilibrees automatiquement.
-  - Algo BRUTE-FORCE OPTIMAL : itere les 126 partitions 5+5 uniques parmi 10.
-  - Metrique d'equilibrage : le PEAK ELO des 6 derniers mois de chaque joueur
-    (issu du compte Riot lie via HenrikDev), et non l'ELO serveur accumule.
-  - Minimise |sum(team_a) - sum(team_b)|.
-    Tie-breakers : ecart des peaks puis ordre des IDs (deterministe).
-  - Map tiree au hasard parmi : Haven, Ascent, Split, Sunset, Abyss,
-    Lotus, Summit.
-  - Lobby leader tire au hasard parmi les 10 joueurs.
-
-
---------------------------------------------------------------------------------
-3.2 QUEUE ADVANCED - DRAFT DE CAPITAINES + PICK/BAN DE MAP
+3.1 TOUTES LES QUEUES - DRAFT DE CAPITAINES + PICK/BAN DE MAP
 --------------------------------------------------------------------------------
 
   Draft de capitaines (services/captain_draft.py)
+    - Utilise par les queues Open, Advanced et Draft (la queue Draft ne
+      compte toujours pas de points : scoreboard seulement).
+    - ELO affiche dans le pool : peak ELO des 6 derniers mois (Open, Draft)
+      ou ELO serveur de la file (Advanced).
     - 2 capitaines tires au hasard parmi les 10 joueurs.
+    - Avant le draft, les joueurs en vocal sont regroupes dans le salon
+      "<File> - Waiting Match" de la categorie du match.
     - Les 8 joueurs restants sont draftes a tour de role par les capitaines.
     - Ordre de selection en serpent : A B B A A B B A (equilibre les choix).
     - UI Discord : embed "🎯 Captain Draft" avec equipes en temps reel, pool
@@ -653,7 +647,7 @@ services/                 Logique pure (testable sans Discord)
   elo_updater.py          apply_match_validation : distribue les gains/pertes
                           (pondere Rating 2.0 ou plat) + last_played
   rating.py               Calcul du Rating 2.0 (compute_rating_2_0)
-  captain_draft.py        Session de draft de capitaines (queue Advanced)
+  captain_draft.py        Session de draft de capitaines (toutes les files)
   map_pick_ban.py         Session de pick/ban de map (queue Advanced)
   scoreboard_img.py       Generation de l'image scoreboard (Pillow)
   inactivity.py           Classement des joueurs les plus inactifs
@@ -671,8 +665,8 @@ services/                 Logique pure (testable sans Discord)
 cogs/                     Wiring Discord (slash commands + vues persistantes)
   queue_v2.py             QueueCog + QueueView (Open/Advanced).
                           /setup-queue, /close-queue.
-  match/                  Package match : formation (auto-equilibrage Open /
-                          draft + pick-ban Advanced), VoteView, verification
+  match/                  Package match : formation (draft de capitaines +
+                          pick-ban, toutes files), VoteView, verification
                           (Henrik + Rating 2.0 + ELO + scoreboard), timeouts,
                           cleanup. /match-cancel, /match-cleanup,
                           /match-replace, /match-force-result.
@@ -704,7 +698,7 @@ Couverture :
   test_elo_calc.py             Calculs ELO + ponderation Rating 2.0
   test_elo_updater.py          MAJ ELO en base (distribution, last_played)
   test_rating_formula.py       Formule Rating 2.0
-  test_captain_draft.py        Draft de capitaines (queue Advanced)
+  test_captain_draft.py        Draft de capitaines (toutes les files)
   test_map_pick_ban.py         Pick/ban de map (queue Advanced)
   test_scoreboard_img.py       Generation de l'image scoreboard
   test_stats_cog.py            /stats (ELO + Rating 2.0)
@@ -793,7 +787,7 @@ Permissions Discord requises pour le bot :
     ELO_MIN_ROUNDS_FOR_WEIGHT = 6
     ELO_WIN_MIN / ELO_WIN_MAX   = 17 / 26   (bornes du gain pondere)
     ELO_LOSS_MIN / ELO_LOSS_MAX = -15 / -22 (bornes de la perte ponderee)
-    MAPS               = Haven, Ascent, Split, Sunset, Abyss, Lotus, Summit
+    MAPS               = Abyss, Bind, Corrode, Haven, Lotus, Summit, Sunset
 
   cogs/elo_admin.py :
     WIN_DELTAS_BY_SLOT  = (20, 18, 17, 16, 15)   (/win manuel par position)

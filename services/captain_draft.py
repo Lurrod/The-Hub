@@ -1,13 +1,10 @@
 """
-Pro Queue Captain Draft Service.
+Captain Draft Service (used by every queue: Open, Advanced, Draft).
 
-Isolated module for the pro queue only. Contains:
+Contains:
   - pick_captains : selection of the 2 captains (random draw)
   - DraftState    : immutable draft state
   - CaptainDraftSession : Discord orchestration (UI + state machine)
-
-Open and GC queues do NOT use this module: they keep
-going through plan_match (auto-balance).
 """
 
 from __future__ import annotations
