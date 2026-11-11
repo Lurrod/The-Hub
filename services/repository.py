@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -189,6 +190,26 @@ def find_riot_account_by_puuid(
     if not puuid:
         return None
     return get_riot_col(db).find_one({"puuid": puuid})
+
+
+def find_riot_account_by_riot_id(
+    db: Database,
+    riot_name: str,
+    riot_tag: str,
+) -> Mapping[str, Any] | None:
+    """Returns the riot_account doc linked to `riot_name#riot_tag`
+    (case-insensitive, exact match), or None.
+
+    Used by /admin-unlink-riot when the linked member is unknown (e.g.
+    the Riot ID is held by a member who left the server)."""
+    if not riot_name or not riot_tag:
+        return None
+    return get_riot_col(db).find_one(
+        {
+            "riot_name": {"$regex": f"^{re.escape(riot_name)}$", "$options": "i"},
+            "riot_tag": {"$regex": f"^{re.escape(riot_tag)}$", "$options": "i"},
+        }
+    )
 
 
 def link_riot_account(

@@ -4,6 +4,7 @@ V2 cog: Discord account <-> Riot account linking.
 Commands:
   /link-riot riot_id:Username#TAG     (region forced to EU)
   /unlink-riot
+  /admin-unlink-riot membre:@x | riot_id:Name#TAG   (admin)
 
 No gate-keeping: rank verification for new members is done manually
 when they enter the Discord server.
@@ -117,8 +118,8 @@ class RiotLinkCog(commands.Cog):
             )
             return
 
-        # 2.7) Peak ELO over the last 6 months. Used to auto-balance the
-        # Open queue (cf. cogs/match/_formation.py). Best-effort: a history
+        # 2.7) Peak ELO over the last 6 months. Shown to captains in the
+        # Open/Draft draft pool (cf. cogs/match/_formation.py). Best-effort: a history
         # fetch failure must NOT block linking — we fall back to the
         # current MMR elo.
         cutoff = datetime.now(UTC) - timedelta(days=180)
@@ -188,6 +189,73 @@ class RiotLinkCog(commands.Cog):
             await interaction.response.send_message("✅ Compte Riot délié.", ephemeral=True)
         else:
             await interaction.response.send_message("ℹ️ Aucun compte Riot lié.", ephemeral=True)
+
+    # ── /admin-unlink-riot ────────────────────────────────────────
+    @app_commands.command(
+        name="admin-unlink-riot",
+        description="Délier le compte Riot d'un membre ou un Riot ID (admin)",
+    )
+    @app_commands.describe(
+        membre="Membre dont on supprime le lien Riot",
+        riot_id="Riot ID à délier (Name#TAG), utile si le membre a quitté le serveur",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def admin_unlink_riot(
+        self,
+        interaction: discord.Interaction,
+        membre: discord.User | None = None,
+        riot_id: str | None = None,
+    ) -> None:
+        if (membre is None) == (riot_id is None):
+            await interaction.response.send_message(
+                "❌ Indique soit `membre`, soit `riot_id` (un seul des deux).",
+                ephemeral=True,
+            )
+            return
+
+        if membre is not None:
+            target_id = str(membre.id)
+            doc = repository.get_riot_account(self.db, target_id)
+            if doc is None:
+                await interaction.response.send_message(
+                    f"ℹ️ Aucun compte Riot lié à <@{target_id}>.", ephemeral=True
+                )
+                return
+        else:
+            try:
+                name, tag = parse_riot_id(riot_id or "")
+            except ValueError:
+                await interaction.response.send_message(
+                    "❌ Format invalide. Attendu : `Name#TAG`.", ephemeral=True
+                )
+                return
+            doc = repository.find_riot_account_by_riot_id(self.db, name, tag)
+            if doc is None:
+                await interaction.response.send_message(
+                    f"ℹ️ Aucun compte lié au Riot ID **{name}#{tag}**.", ephemeral=True
+                )
+                return
+            target_id = str(doc["_id"])
+
+        repository.unlink_riot_account(self.db, target_id)
+        linked = f"{doc.get('riot_name', '?')}#{doc.get('riot_tag', '?')}"
+        logger.info(
+            "[admin-unlink-riot] admin=%s unlinked %s from user=%s",
+            interaction.user.id,
+            linked,
+            target_id,
+        )
+        await interaction.response.send_message(
+            f"✅ Compte Riot **{linked}** délié de <@{target_id}>.", ephemeral=True
+        )
+
+    @admin_unlink_riot.error
+    async def _admin_unlink_riot_error(self, interaction: discord.Interaction, error) -> None:
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "🚫 Réservé aux administrateurs.", ephemeral=True
+            )
 
 
 async def setup(bot: commands.Bot, db, riot_client: HenrikDevClient) -> None:

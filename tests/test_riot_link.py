@@ -263,3 +263,122 @@ async def test_unlink_riot_when_not_linked():
 
     args, _ = inter.response.send_message.call_args
     assert "Aucun compte Riot lié" in args[0]
+
+
+# ── /admin-unlink-riot ────────────────────────────────────────────
+def _seed_link(db, user_id: int, name: str = "Player", tag: str = "EUW", puuid: str = "abc"):
+    from services import repository
+
+    repository.link_riot_account(
+        db,
+        user_id=user_id,
+        riot_name=name,
+        riot_tag=tag,
+        riot_region="eu",
+        puuid=puuid,
+        peak_elo=1500,
+        source="peak_6mo",
+    )
+
+
+async def test_admin_unlink_riot_by_member():
+    import bot as bot_module
+    from services import repository
+
+    _seed_link(bot_module.db, 7, name="Target", tag="EUW")
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+    inter = _fake_interaction(_fake_member(1, "Admin"))
+
+    await cog.admin_unlink_riot.callback(cog, inter, membre=_fake_member(7), riot_id=None)
+
+    args, kwargs = inter.response.send_message.call_args
+    assert "Target#EUW" in args[0]
+    assert "<@7>" in args[0]
+    assert kwargs.get("ephemeral") is True
+    assert repository.get_riot_account(bot_module.db, 7) is None
+
+
+async def test_admin_unlink_riot_by_riot_id_is_case_insensitive():
+    import bot as bot_module
+    from services import repository
+
+    _seed_link(bot_module.db, 8, name="Some.Player", tag="1234")
+    _seed_link(bot_module.db, 9, name="Other", tag="EUW", puuid="other")
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+    inter = _fake_interaction(_fake_member(1, "Admin"))
+
+    await cog.admin_unlink_riot.callback(cog, inter, membre=None, riot_id="some.player#1234")
+
+    args, _ = inter.response.send_message.call_args
+    assert "Some.Player#1234" in args[0]
+    assert "<@8>" in args[0]
+    assert repository.get_riot_account(bot_module.db, 8) is None
+    # The regex must be anchored/escaped: other links stay untouched.
+    assert repository.get_riot_account(bot_module.db, 9) is not None
+
+
+async def test_admin_unlink_riot_member_not_linked():
+    import bot as bot_module
+
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+    inter = _fake_interaction(_fake_member(1, "Admin"))
+
+    await cog.admin_unlink_riot.callback(cog, inter, membre=_fake_member(55), riot_id=None)
+
+    args, _ = inter.response.send_message.call_args
+    assert "Aucun compte Riot" in args[0]
+
+
+async def test_admin_unlink_riot_unknown_riot_id():
+    import bot as bot_module
+
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+    inter = _fake_interaction(_fake_member(1, "Admin"))
+
+    await cog.admin_unlink_riot.callback(cog, inter, membre=None, riot_id="Ghost#404")
+
+    args, _ = inter.response.send_message.call_args
+    assert "Aucun compte" in args[0]
+    assert "Ghost#404" in args[0]
+
+
+async def test_admin_unlink_riot_requires_exactly_one_target():
+    import bot as bot_module
+    from services import repository
+
+    _seed_link(bot_module.db, 7, name="Target", tag="EUW")
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+
+    inter_none = _fake_interaction(_fake_member(1, "Admin"))
+    await cog.admin_unlink_riot.callback(cog, inter_none, membre=None, riot_id=None)
+    args, _ = inter_none.response.send_message.call_args
+    assert "membre" in args[0] and "riot_id" in args[0]
+
+    inter_both = _fake_interaction(_fake_member(1, "Admin"))
+    await cog.admin_unlink_riot.callback(
+        cog, inter_both, membre=_fake_member(7), riot_id="Target#EUW"
+    )
+    args, _ = inter_both.response.send_message.call_args
+    assert "membre" in args[0] and "riot_id" in args[0]
+    assert repository.get_riot_account(bot_module.db, 7) is not None
+
+
+async def test_admin_unlink_riot_invalid_riot_id_format():
+    import bot as bot_module
+
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+    inter = _fake_interaction(_fake_member(1, "Admin"))
+
+    await cog.admin_unlink_riot.callback(cog, inter, membre=None, riot_id="no-tag-here")
+
+    args, _ = inter.response.send_message.call_args
+    assert args[0].startswith("❌")
+
+
+def test_admin_unlink_riot_requires_manage_guild():
+    import bot as bot_module
+
+    cog = RiotLinkCog(bot_module.bot, bot_module.db, _fake_riot_client())
+    perms = cog.admin_unlink_riot.default_permissions
+    assert perms is not None and perms.manage_guild
+    assert cog.admin_unlink_riot.checks, "a runtime permission check is required"

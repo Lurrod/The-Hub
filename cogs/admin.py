@@ -299,6 +299,11 @@ class AdminCog(commands.Cog):
                 inline=False,
             )
             embed.add_field(
+                name="/admin-unlink-riot membre | riot_id",
+                value="Délie le compte Riot d'un membre (ou un Riot ID précis)",
+                inline=False,
+            )
+            embed.add_field(
                 name="/bypass @role",
                 value="Donne à un rôle l'accès aux commandes admin",
                 inline=False,
